@@ -1,0 +1,32 @@
+[profile.default]
+src = "src"
+script = "scripts"
+out = "out"
+libs = ["lib"]
+evm_version = "cancun"
+via-ir = true
+optimizer = true
+optimizer_runs = 1
+
+remappings = [
+    "@uniswap/v4-core/=lib/v4-core/",
+    "@openzeppelin/=lib/openzeppelin-contracts/",
+    "openzeppelin-contracts/=lib/openzeppelin-contracts/",
+    "solmate/=lib/v4-core/lib/solmate/",
+    "v4-core/=lib/v4-core/src/",
+    "alf/=src/alf/"
+]
+
+[profile.sepolia]
+solc_version = "0.8.26"
+
+[fuzz]
+runs = 256
+
+[invariant]
+runs = 256
+depth = 500
+
+[fmt]
+line_length = 120
+tab_width = 4

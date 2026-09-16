@@ -20,7 +20,7 @@ contract RingLPRouter is IUnlockCallback, ReentrancyGuardTransient {
     using CurrencyLibrary for Currency;
     using TransientStateLibrary for IPoolManager;
     IPoolManager public immutable poolManager;
-    bytes32 private constant SYNC_SWAP = keccak256("RingBackedLiqHook.sync");
+    bytes32 private constant SYNC_SWAP = keccak256("RingV4JitHook.sync");
     error InvalidSwap();
     error Expired();
     error UnauthorizedCallback();

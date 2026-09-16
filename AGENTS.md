@@ -6,7 +6,7 @@ Use English for all source code, comments, documentation, tests, commit messages
 
 ## Project Overview
 
-RingV4BackedLiqHook is a Foundry-based Solidity project implementing a Uniswap v4 hook that backs a single v4 pool with full-range permanent liquidity and real per-order JIT LP sourced from a configurable FewToken v4 backend pool.
+RingV4JitHook is a Foundry-based Solidity project implementing a Uniswap v4 hook that backs a single v4 pool with full-range permanent liquidity and real per-order JIT LP sourced from a configurable FewToken v4 backend pool.
 
 ## Architecture
 

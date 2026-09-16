@@ -28,7 +28,22 @@ import {IFewFactory} from "../interfaces/external/IFewFactory.sol";
 import {IFewWrappedToken} from "../interfaces/external/IFewWrappedToken.sol";
 import {jitLockFor, requireJITNotInProgress} from "../alf/types/JITLock.sol";
 
-contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuardTransient {
+/// @title RingV4JitHook
+/// @notice JIT-backed Uniswap v4 hook that sources real FewToken v4 liquidity for each swap.
+/// @dev
+///  Example lifecycle for a user selling 0.5 ETH (currency0) to buy 1,000 USDC (currency1):
+///   1. Owner initializes the outer pool with ETH/USDC as currency0/currency1 and adds full-range LP.
+///   2. Owner sets a backend FewToken v4 pool with fwETH/fwUSDC whose raw tokens are ETH/USDC.
+///   3. A user calls `poolManager.swap` on the outer pool with `amountSpecified = -1_000e6`
+///      (exact output of 1,000 USDC) and `zeroForOne = true`.
+///   4. `_beforeSwap` is invoked: it quotes the backend, finds the JIT liquidity that makes
+///      the outer-pool cost match the backend quote, adds that JIT position, and prefunds the
+///      1,000 USDC by wrapping ETH, swapping on the backend, and unwrapping the USDC.
+///   5. The outer v4 swap executes through the JIT + permanent liquidity, consuming ~0.5 ETH
+///      and producing ~1,000 USDC in PoolManager deltas.
+///   6. `_afterSwap` removes the JIT position, validates the deltas, and resolves any small
+///      rounding remainder using `roundingReserve` (capped at MAX_ROUNDING_LOSS per currency).
+contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
@@ -38,10 +53,10 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
     uint256 public constant MAX_ROUNDING_LOSS = 8;
     uint256 public constant MIN_BUFFER = 16;
     uint256 public constant MAX_SPOT_DEVIATION_BPS = 500;
-    bytes32 public constant SYNC_SWAP = keccak256("RingBackedLiqHook.sync");
-    bytes32 private constant LP_SALT = keccak256("RingV4BackedLiqHook.position");
+    bytes32 public constant SYNC_SWAP = keccak256("RingV4JitHook.sync");
+    bytes32 private constant LP_SALT = keccak256("RingV4JitHook.position");
     IFewFactory public immutable fewFactory;
-    RingV4BackedLiqQuoter private immutable _quoter;
+    RingV4JitQuoter private immutable _quoter;
     address public immutable factory;
     bool public initialized;
     bool public live;
@@ -81,7 +96,7 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
     event RoundingFunded(Currency indexed currency, uint256 amount);
     event FbPoolSet(PoolId indexed curPoolId, PoolKey fbPoolKey);
     event FbPoolRemoved(PoolId indexed curPoolId);
-    event RingBackedSwap(
+    event RingJitSwap(
         PoolId indexed poolId, bool zeroForOne, uint256 amountIn, uint256 amountOut, uint256 loss0, uint256 loss1
     );
     event PriceSyncSwap(PoolId indexed poolId, bool zeroForOne, uint256 amountIn, uint256 amountOut);
@@ -89,7 +104,7 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
     constructor(IPoolManager manager, IFewFactory few, address owner_) BaseHook(manager) Ownable(owner_) {
         if (address(manager) == address(0) || address(few) == address(0)) revert InvalidPool();
         fewFactory = few;
-        _quoter = new RingV4BackedLiqQuoter(manager);
+        _quoter = new RingV4JitQuoter(manager);
         factory = msg.sender;
     }
 
@@ -212,6 +227,15 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
         }
     }
 
+    /// @notice Computes the quoted input/output and the JIT plan for a requested swap.
+    /// @dev
+    ///  Example: `zeroForOne = true`, `amountSpecified = -1_000e6` (exact 1,000 USDC out).
+    ///   - The function checks the outer pool is live and has rounding buffers.
+    ///   - It fetches the current slot0 and permanent liquidity.
+    ///   - It searches `_findHybridPlan` for the smallest JIT liquidity that makes the outer
+    ///     pool's required ETH input equal to the FewV4 backend's ETH input for 1,000 USDC.
+    ///   - If no JIT is needed, it validates the outer/inner price deviation is within the
+    ///     allowed 500 bps band (plus fees).
     function _quote(PoolKey calldata key, bool forward, int256 specified)
         private
         view
@@ -259,6 +283,15 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
         return IHooks.beforeRemoveLiquidity.selector;
     }
 
+    /// @notice Hook entry point before the outer swap.
+    /// @dev
+    ///  Example: user swaps exact 1,000 USDC out, `zeroForOne = true`.
+    ///   - Enters the JIT lock and rejects non-zero outer-pool fees.
+    ///   - If `hookData == SYNC_SWAP`, this is a price-sync trade against permanent liquidity.
+    ///   - Otherwise `_quote` is called to get the plan (ringIn/ringOut/JIT liquidity).
+    ///   - The user's `sqrtPriceLimitX96` is checked against the planned end price.
+    ///   - If a JIT plan exists, `_execute` prefunds the output and `modifyLiquidity` adds
+    ///     the JIT position so the outer swap can clear at the quoted price.
     function _beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata hookData)
         internal
         override
@@ -294,6 +327,19 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
+    /// @notice Hook exit point after the outer swap has executed.
+    /// @dev
+    ///  Example: user received 1,000 USDC and paid 0.5 ETH.
+    ///   - For a SYNC_SWAP it only verifies direction and emits `PriceSyncSwap`.
+    ///   - For a normal swap it verifies `delta` matches `_active` (input = -p.amountIn,
+    ///     output = p.amountOut, end price = p.end).
+    ///   - It enforces a post-swap price limit: the outer pool's end price must stay within
+    ///     `MAX_SPOT_DEVIATION_BPS` (plus the backend fee buffer) of the backend FewToken
+    ///     pool price, reverting `PriceLimitExceeded` otherwise. This blocks flash-loan
+    ///     manipulation that would push the outer price away from the backed reference.
+    ///   - It removes the JIT position if one was added.
+    ///   - It donates small positive deltas to the pool (rewards) and resolves the remaining
+    ///     rounding with `roundingReserve`.
     function _afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata)
         internal
         override
@@ -323,6 +369,11 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
         }
         (uint160 end,,,) = poolManager.getSlot0(configuredPoolId);
         if (end != p.end) revert UnexpectedFill();
+        // Post-swap price limit: keep the outer pool price aligned with the backend
+        // FewToken pool so a flash-loan cannot push it away from the backed reference.
+        FbPool memory fb = _route();
+        (uint256 deviationBps, uint256 allowedBps) = _spotDeviationBps(end, params.zeroForOne, fb);
+        if (deviationBps > allowedBps) revert PriceLimitExceeded();
         if (p.liquidity != 0) {
             poolManager.modifyLiquidity(
                 key, ModifyLiquidityParams(p.lower, p.upper, -int256(uint256(p.liquidity)), LP_SALT), ""
@@ -337,10 +388,16 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
         delete _balance1Before;
         delete _activeDonationLimit;
         jitLockFor(configuredPoolId).clear();
-        emit RingBackedSwap(configuredPoolId, params.zeroForOne, p.amountIn, p.amountOut, loss0, loss1);
+        emit RingJitSwap(configuredPoolId, params.zeroForOne, p.amountIn, p.amountOut, loss0, loss1);
         return (IHooks.afterSwap.selector, 0);
     }
 
+    /// @notice Donates any hook credits up to the active limit, then resolves the remaining
+    /// per-currency deltas.
+    /// @dev
+    ///  Example: after the swap the hook is owed 1e6 USDC (reward). If this is within the
+    ///   active limit (for the output currency), it is donated to the LPs. Any small leftover
+    ///   is then settled or taken in `_resolve`.
     function _donateCreditsThenResolve(PoolKey calldata key, bool zeroForOne) private {
         int256 d0 = poolManager.currencyDelta(address(this), key.currency0);
         int256 d1 = poolManager.currencyDelta(address(this), key.currency1);
@@ -354,6 +411,16 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
         _resolve(key.currency1);
     }
 
+    /// @notice Searches for a JIT liquidity amount such that the outer-pool swap cost matches
+    /// the FewV4 backend swap cost.
+    /// @dev
+    ///  Example: baseLiquidity = 10_000, requested USDC out = 1_000, `forward = true`.
+    ///   - It tries candidate JIT liquidities (base, 2x, 4x, ... up to 32 doublings) and runs
+    ///     the backend quote to compare `ringIn` (backend ETH in) vs `jitIn` (outer ETH in).
+    ///   - The difference `diff = ringIn - jitIn` tells us whether the backend is cheaper.
+    ///   - It keeps the candidate with |diff| closest to zero, then narrows with binary search.
+    ///   - If a "surplus" candidate (`diff <= 0`) fits within one backend-input quantum, it is
+    ///     preferred; otherwise the function falls back to pure permanent liquidity (no JIT).
     function _findHybridPlan(
         uint160 start,
         uint128 baseLiquidity,
@@ -439,6 +506,11 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
         }
     }
 
+    /// @notice Returns the incremental backend input cost of one extra output unit plus
+    /// the constant rounding allowance.
+    /// @dev Example: backend needs 0.5004 ETH for 1_000 USDC and 0.5004005 for 1_001 USDC,
+    ///  so the quantum is ~0.0000005 ETH + 8. It is used to accept a small surplus in
+    ///  `_findHybridPlan`.
     function inputQuantum(FbPool calldata fb, bool forward, uint256 output) external view returns (uint256) {
         if (msg.sender != address(this)) revert InvalidPool();
         (uint256 current,,) = _quoter.quote(fb.fbPoolKey, forward == fb.orderAligned, SafeCast.toInt256(output));
@@ -454,6 +526,10 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
         }
     }
 
+    /// @notice Compares the outer pool price to the backend FewToken pool price.
+    /// @dev
+    ///  Example: if the outer price is 5% higher than the backend, the returned deviation
+    ///   is roughly 500 bps; it must not exceed `allowedBps` (500 bps + fee buffer).
     function _spotDeviationBps(uint160 start, bool forward, FbPool memory fb)
         private
         view
@@ -492,6 +568,8 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
         ) revert FullRangeLiquidityOnly();
     }
 
+    /// @notice Settles a negative delta or takes a positive delta, capping the amount.
+    /// @dev Example: if the hook owes 3 wei of currency0, it settles; if owed 2 wei, it takes.
     function _resolve(Currency currency) private {
         int256 delta = poolManager.currencyDelta(address(this), currency);
         uint256 amount = SafeCast.toUint256(delta < 0 ? -delta : delta);
@@ -501,6 +579,8 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
         _requireDelta(currency, 0);
     }
 
+    /// @notice Deducts the balance decrease of `currency` from `roundingReserve`.
+    /// @dev Example: before=1_000, after=997 -> loss=3, which is subtracted from the reserve.
     function _chargeRounding(Currency currency, uint256 beforeBalance) private returns (uint256 loss) {
         uint256 afterBalance = currency.balanceOfSelf();
         if (afterBalance > beforeBalance) revert UnexpectedTokenDelta();
@@ -563,6 +643,15 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
         if (poolManager.currencyDelta(address(this), currency) != expected) revert UnexpectedTokenDelta();
     }
 
+    /// @notice Performs the actual FewToken v4 backend swap and unwraps the result.
+    /// @dev
+    ///  Example: user sells ETH for USDC, `ringIn = 0.5e18`, `ringOut = 1_000e6`.
+    ///   1. Re-quote the backend for exactly `ringOut` USDC to obtain `ringIn` ETH.
+    ///   2. Take raw ETH from PoolManager, wrap into fwETH, and approve it.
+    ///   3. Swap on the backend (exact output) to receive `ringOut` fwUSDC.
+    ///   4. Unwrap fwUSDC into raw USDC and settle it to PoolManager.
+    ///   5. After this, the hook's PoolManager deltas are `-ringIn` input and `+ringOut`
+    ///      output, matching the user-facing outer swap.
     function _execute(bool forward, uint256 ringIn, uint256 ringOut) private {
         FbPool memory fb = _route();
         bool fbForward = forward == fb.orderAligned;
@@ -627,7 +716,7 @@ contract RingV4BackedLiqHook is BaseHook, DeltaResolver, Ownable2Step, Reentranc
     }
 }
 
-contract RingV4BackedLiqQuoter {
+contract RingV4JitQuoter {
     IPoolManager private immutable _manager;
 
     constructor(IPoolManager manager) {
@@ -641,17 +730,17 @@ contract RingV4BackedLiqQuoter {
         int256 specified,
         bool forward,
         int24 spacing,
-        RingV4BackedLiqHook.FbPool calldata fb
+        RingV4JitHook.FbPool calldata fb
     ) external view returns (uint256 ringIn, uint256 ringOut, RingLPPlanner.Plan memory p, int256 difference) {
         uint256 jitIn;
         uint256 jitOut;
         (p, jitIn, jitOut) =
             RingLPPlanner.planAtCurrent(start, baseLiquidity, jitLiquidity, specified, forward, spacing);
-        if (jitOut == 0 || jitOut > type(uint96).max) revert RingV4BackedLiqHook.UnexpectedFill();
+        if (jitOut == 0 || jitOut > type(uint96).max) revert RingV4JitHook.UnexpectedFill();
         (ringIn, ringOut,) =
             FewV4Quoter.quote(_manager, fb.fbPoolKey, forward == fb.orderAligned, SafeCast.toInt256(jitOut));
         if (ringOut != jitOut || ringIn == 0 || ringIn > uint256(uint128(type(int128).max))) {
-            revert RingV4BackedLiqHook.UnexpectedFill();
+            revert RingV4JitHook.UnexpectedFill();
         }
         difference = SafeCast.toInt256(ringIn) - SafeCast.toInt256(jitIn);
     }

@@ -20,7 +20,7 @@ import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TransientStateLibrary} from "@uniswap/v4-core/src/libraries/TransientStateLibrary.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
-import {RingV4BackedLiqHook} from "../src/hooks/RingV4BackedLiqHook.sol";
+import {RingV4JitHook} from "../src/hooks/RingV4JitHook.sol";
 import {RingLPRouter} from "../src/routers/RingLPRouter.sol";
 import {RingLPPlanner} from "../src/libraries/RingLPPlanner.sol";
 import {FewV4Quoter} from "../src/libraries/FewV4Quoter.sol";
@@ -93,7 +93,7 @@ contract FewV4QuoteHarness {
     }
 }
 
-contract RingV4BackedLiqHookTest is Test {
+contract RingV4JitHookTest is Test {
     using StateLibrary for IPoolManager;
     using TransientStateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
@@ -104,7 +104,7 @@ contract RingV4BackedLiqHookTest is Test {
     PoolManager manager;
     IPoolManager pm;
     MockFewFactory few;
-    RingV4BackedLiqHook hook;
+    RingV4JitHook hook;
     RingLPRouter router;
     PoolSwapTest backendRouter;
     PoolModifyLiquidityTest lp;
@@ -172,8 +172,8 @@ contract RingV4BackedLiqHookTest is Test {
         pm.initialize(fbKey, Q96);
         _fullRange(fbKey, int256(uint256(BACKEND_LIQUIDITY)));
         bytes memory args = abi.encode(pm, few, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4BackedLiqHook).creationCode, args, 0x2ac0, 300_000);
-        hook = new RingV4BackedLiqHook{salt: salt}(pm, few, address(this));
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x2ac0, 300_000);
+        hook = new RingV4JitHook{salt: salt}(pm, few, address(this));
         key = PoolKey(Currency.wrap(a), Currency.wrap(b), 0, 60, IHooks(address(hook)));
         hook.initializePool(key, Q96);
         hook.setFbPool(key, fbKey);
@@ -360,7 +360,7 @@ contract RingV4BackedLiqHookTest is Test {
                 bytes32 beforeState = _state();
                 uint256 supplyA = input.totalSupply();
                 uint256 supplyB = output.totalSupply();
-                _expectHookError(RingV4BackedLiqHook.UnexpectedTokenDelta.selector);
+                _expectHookError(RingV4JitHook.UnexpectedTokenDelta.selector);
                 router.swap(key, _params(true, -int256(1 ether)), p.amountOut, block.timestamp);
                 assertEq(_state(), beforeState);
                 assertEq(input.totalSupply(), supplyA);
@@ -437,7 +437,7 @@ contract RingV4BackedLiqHookTest is Test {
             (,, RingLPPlanner.Plan memory p) = hook.quote(key, true, -int256(1 ether));
             assertGt(p.liquidity, 0);
             bytes32 beforeState = _state();
-            _expectHookError(RingV4BackedLiqHook.UnexpectedFill.selector);
+            _expectHookError(RingV4JitHook.UnexpectedFill.selector);
             router.swap(key, _params(true, -int256(1 ether)), p.amountOut, block.timestamp);
             assertEq(_state(), beforeState);
             assertEq(input.callbackAttempts(), 0);
@@ -638,8 +638,8 @@ contract RingV4BackedLiqHookTest is Test {
     function test_InitializeRejectsNativeNonzeroFeeAndDuplicatePool() public {
         MockFewFactory otherFew = new MockFewFactory();
         bytes memory args = abi.encode(pm, otherFew, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4BackedLiqHook).creationCode, args, 0x2ac0, 300_000);
-        RingV4BackedLiqHook other = new RingV4BackedLiqHook{salt: salt}(pm, otherFew, address(this));
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x2ac0, 300_000);
+        RingV4JitHook other = new RingV4JitHook{salt: salt}(pm, otherFew, address(this));
         PoolKey memory candidate = key;
         candidate.hooks = IHooks(address(other));
         candidate.currency0 = Currency.wrap(address(0));

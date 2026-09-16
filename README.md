@@ -1,10 +1,10 @@
-# RingV4BackedLiqHook
+# RingV4JitHook
 
 A Uniswap v4 hook that backs a single v4 pool with full-range permanent liquidity and real per-order JIT LP sourced from a configurable FewToken v4 backend pool.
 
 ## How it works
 
-1. **Outer pool**: A single v4 pool with full-range permanent base liquidity, hooked to `RingV4BackedLiqHook`.
+1. **Outer pool**: A single v4 pool with full-range permanent base liquidity, hooked to `RingV4JitHook`.
 2. **Backend pool**: An owner-registered hookless FewToken v4 pool (`setFbPool` / `setFbPools`), providing real liquidity for JIT execution.
 3. **Swap flow**:
    - `beforeSwap`: Hook quotes the backend, wraps raw tokens to FewToken, executes a real v4 swap on the backend pool, unwraps back, then adds JIT liquidity to the outer v4 pool.
@@ -28,7 +28,7 @@ forge test -vv
 
 ```
 src/
-  hooks/RingV4BackedLiqHook.sol   # Main hook + RingV4BackedLiqQuoter
+  hooks/RingV4JitHook.sol   # Main hook + RingV4JitQuoter
   routers/RingLPRouter.sol         # Prefunded swap router
   libraries/
     RingLPPlanner.sol              # JIT LP planning math
@@ -46,6 +46,6 @@ src/
     types/JITLock.sol
     libraries/FeeLib.sol
 test/
-  RingV4BackedLiqHook.t.sol        # 34 tests
+  RingV4JitHook.t.sol        # 34 tests
   TestHelpers.sol                  # Mocks: MockFewFactory, MockFewWrappedToken, HookMiner
 ```

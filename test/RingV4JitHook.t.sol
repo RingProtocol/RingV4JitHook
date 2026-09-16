@@ -561,15 +561,7 @@ contract RingV4JitHookTest is Test {
         vm.expectRevert();
         router.swap(key, _params(true, -int256(1 ether)), 1, block.timestamp);
         assertEq(_state(), beforeState);
-        PoolKey[] memory current = new PoolKey[](1);
-        PoolKey[] memory backing = new PoolKey[](1);
-        current[0] = key;
-        backing[0] = replacement;
-        hook.setLpPools(current, backing);
-        assertTrue(hook.getLpPool(key).set);
-        backing = new PoolKey[](0);
-        vm.expectRevert();
-        hook.setLpPools(current, backing);
+        hook.setLpPool(key, replacement);
         assertTrue(hook.getLpPool(key).set);
     }
 
@@ -598,15 +590,9 @@ contract RingV4JitHookTest is Test {
 
     function test_AdministrationUnauthorized() public {
         address outsider = address(0xbeef);
-        PoolKey[] memory current = new PoolKey[](1);
-        PoolKey[] memory backing = new PoolKey[](1);
-        current[0] = key;
-        backing[0] = lpKey;
         vm.startPrank(outsider);
         vm.expectRevert();
         hook.setLpPool(key, lpKey);
-        vm.expectRevert();
-        hook.setLpPools(current, backing);
         vm.expectRevert();
         hook.fundRounding(key.currency0, 1);
         vm.expectRevert();
@@ -618,15 +604,11 @@ contract RingV4JitHookTest is Test {
         router.unlockCallback("");
     }
 
-    function test_BatchInvalidSecondPoolRollsBackFirstRemoval() public {
-        PoolKey[] memory current = new PoolKey[](2);
-        PoolKey[] memory backing = new PoolKey[](2);
-        current[0] = key;
-        current[1] = key;
-        current[1].tickSpacing = 1;
-        backing[1] = lpKey;
+    function test_InvalidPoolRollsBackWithoutAffectingExistingRoute() public {
+        PoolKey memory bad = key;
+        bad.tickSpacing = 1;
         vm.expectRevert();
-        hook.setLpPools(current, backing);
+        hook.setLpPool(bad, lpKey);
         assertTrue(hook.getLpPool(key).set);
         assertEq(PoolId.unwrap(hook.getLpPool(key).lpPoolKey.toId()), PoolId.unwrap(lpKey.toId()));
     }

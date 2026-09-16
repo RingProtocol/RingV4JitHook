@@ -5,7 +5,7 @@ A Uniswap v4 hook that backs multiple v4 pools with real per-order JIT LP source
 ## How it works
 
 1. **Shell pools**: Any number of v4 pools initialized with `RingV4JitHook` as their hook. Each pool is registered in `_beforeInitialize`, recorded in `poolIds`, and mapped to its `PoolKey` via `poolKeys[poolId]`. Ordinary LP positions may use any range (full-range is not enforced).
-2. **Backend pool**: An owner-registered hookless FewToken v4 pool per shell pool (`setLpPool` / `setLpPools`), providing real liquidity for JIT execution. The referenced shell pool must already be registered by `_beforeInitialize`.
+2. **Backend pool**: An owner-registered hookless FewToken v4 pool per shell pool (`setLpPool`), providing real liquidity for JIT execution. The referenced shell pool must already be registered by `_beforeInitialize`.
 3. **Swap flow**:
    - `beforeSwap`: Hook quotes the backend, wraps raw tokens to FewToken, executes a real v4 swap on the backend pool, unwraps back, then adds JIT liquidity to the shell v4 pool.
    - The shell v4 pool executes the user's swap against the JIT liquidity.

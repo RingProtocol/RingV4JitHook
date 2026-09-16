@@ -132,18 +132,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         _setLpPool(curPoolKey, lpPoolKey);
     }
 
-    function setLpPools(PoolKey[] calldata curPoolKeys, PoolKey[] calldata lpPoolKeys)
-        external
-        onlyOwner
-        idle
-        nonReentrant
-    {
-        if (curPoolKeys.length == 0 || curPoolKeys.length != lpPoolKeys.length) revert InvalidRoute();
-        for (uint256 i; i < curPoolKeys.length; ++i) {
-            _setLpPool(curPoolKeys[i], lpPoolKeys[i]);
-        }
-    }
-
     function getLpPool(PoolKey calldata key) external view returns (LpPool memory) {
         return lpPools[key.toId()];
     }

@@ -182,7 +182,6 @@ contract RingV4JitHookTest is Test {
         hook.fundRounding(key.currency0, 1_000_000);
         hook.fundRounding(key.currency1, 1_000_000);
         _fullRange(key, int256(uint256(BASE_LIQUIDITY)));
-        hook.setPoolLive(key, true);
     }
 
     function _approve(address token) internal {
@@ -609,8 +608,6 @@ contract RingV4JitHookTest is Test {
         vm.expectRevert();
         hook.setLpPools(current, backing);
         vm.expectRevert();
-        hook.setPoolLive(key, false);
-        vm.expectRevert();
         hook.fundRounding(key.currency0, 1);
         vm.expectRevert();
         hook.withdrawRounding(key.currency0, 1, outsider);
@@ -651,8 +648,6 @@ contract RingV4JitHookTest is Test {
         candidate.fee = 0;
         pm.initialize(candidate, Q96);
         assertFalse(other.getLpPool(candidate).set);
-        vm.expectRevert();
-        other.setPoolLive(candidate, true);
         vm.expectRevert();
         pm.initialize(candidate, Q96);
         vm.expectRevert();
@@ -832,11 +827,7 @@ contract RingV4JitHookTest is Test {
         _trade(true, true, 1 ether);
     }
 
-    function test_PauseBufferAndProtocolFeeGuards() public {
-        hook.setPoolLive(key, false);
-        vm.expectRevert();
-        router.swap(key, _params(true, -int256(1 ether)), 1, block.timestamp);
-        hook.setPoolLive(key, true);
+    function test_BufferAndProtocolFeeGuards() public {
         hook.withdrawRounding(key.currency0, 999_990, address(this));
         assertEq(hook.getIndicativeQuote(key, true, -int256(1 ether), ""), 0);
         vm.expectRevert();

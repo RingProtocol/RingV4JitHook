@@ -131,13 +131,7 @@ contract RingV4JitHookForkTest is Test {
         assertGt(pm.getLiquidity(key.toId()), 0, "shell pool has no base liquidity");
 
         // ------------------------------------------------------------------
-        // 9. Set pool live
-        // ------------------------------------------------------------------
-        hook.setPoolLive(key, true);
-        assertTrue(hook.poolLive(key.toId()));
-
-        // ------------------------------------------------------------------
-        // 10. Approve router
+        // 9. Approve router
         // ------------------------------------------------------------------
         IERC20(WBTC).approve(address(router), type(uint256).max);
         IERC20(WETH).approve(address(router), type(uint256).max);
@@ -314,8 +308,6 @@ contract RingV4JitHookForkTest is Test {
         vm.startPrank(outsider);
         vm.expectRevert();
         hook.setLpPool(key, lpKey);
-        vm.expectRevert();
-        hook.setPoolLive(key, false);
         vm.expectRevert();
         hook.fundRounding(key.currency0, 1);
         vm.expectRevert();

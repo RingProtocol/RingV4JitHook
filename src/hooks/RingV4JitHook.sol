@@ -35,7 +35,7 @@ import {jitLockFor, requireJITNotInProgress} from "../alf/types/JITLock.sol";
 ///   1. Anyone initializes an shell pool with ETH/USDC as currency0/currency1 via `poolManager.initialize`.
 ///      The hook's `_beforeInitialize` validates and records the pool.
 ///   2. Owner sets a backend FewToken v4 pool with fwETH/fwUSDC whose raw tokens are ETH/USDC.
-///   3. Owner adds liquidity to the shell pool and calls `setPoolLive(key, true)`.
+///   3. Owner adds liquidity to the shell pool.
 ///   4. A user calls `poolManager.swap` on the shell pool with `amountSpecified = -1_000e6`
 ///      (exact output of 1,000 USDC) and `zeroForOne = true`.
 ///   5. `_beforeSwap` is invoked: it quotes the backend, finds the JIT liquidity that makes
@@ -65,9 +65,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     PoolId[] public poolIds;
     /// @notice Maps a registered shell-pool ID to its PoolKey.
     mapping(PoolId => PoolKey) public poolKeys;
-    /// @notice Per-pool live flag; swaps are only accepted when `poolLive[poolId]` is true.
-    mapping(PoolId => bool) public poolLive;
-
     /// @notice Per-pool backend FewToken v4 pool configuration.
     mapping(PoolId => LpPool) public lpPools;
     mapping(Currency => uint256) public roundingReserve;
@@ -85,7 +82,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
 
     error InvalidPool();
     error InvalidRoute();
-    error PoolNotLive();
     error ProtocolFeeNotSupported();
     error InsufficientRoundingBuffer();
     error UnexpectedTokenDelta();
@@ -98,7 +94,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     error RenounceOwnershipDisabled();
 
     event PoolCreated(PoolId indexed poolId);
-    event LiveSet(PoolId indexed poolId, bool live);
     event RoundingFunded(Currency indexed currency, uint256 amount);
     event LpPoolSet(PoolId indexed curPoolId, PoolKey lpPoolKey);
     event LpPoolRemoved(PoolId indexed curPoolId);
@@ -180,19 +175,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         currency.transfer(to, amount);
     }
 
-    function setPoolLive(PoolKey calldata key, bool enabled) external onlyOwner idle {
-        _requirePool(key);
-        PoolId poolId = key.toId();
-        if (enabled) {
-            _route(poolId);
-            _requireBuffers(key);
-            _requireZeroFees(poolId);
-            if (poolManager.getLiquidity(poolId) == 0) revert UnexpectedLiquidity();
-        }
-        poolLive[poolId] = enabled;
-        emit LiveSet(poolId, enabled);
-    }
-
     function getSpotDeviationBps(PoolKey calldata key, bool forward)
         external
         view
@@ -244,7 +226,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     {
         _requirePool(key);
         PoolId poolId = key.toId();
-        if (!poolLive[poolId]) revert PoolNotLive();
         _requireBuffers(key);
         if (specified == 0 || specified == type(int256).min) revert UnexpectedFill();
         uint256 requested = SafeCast.toUint256(specified < 0 ? -specified : specified);
@@ -300,7 +281,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         jitLockFor(poolId).enter();
         _requireZeroFees(poolId);
         if (hookData.length == 32 && abi.decode(hookData, (bytes32)) == SYNC_SWAP) {
-            if (!poolLive[poolId]) revert PoolNotLive();
             _route(poolId);
             _syncing = true;
             return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);

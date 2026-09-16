@@ -172,7 +172,7 @@ contract RingV4JitHookTest is Test {
         pm.initialize(lpKey, Q96);
         _fullRange(lpKey, int256(uint256(BACKEND_LIQUIDITY)));
         bytes memory args = abi.encode(pm, few, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 300_000);
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 10_000_000);
         hook = new RingV4JitHook{salt: salt}(pm, few, address(this));
         key = PoolKey(Currency.wrap(a), Currency.wrap(b), 0, 60, IHooks(address(hook)));
         pm.initialize(key, Q96);
@@ -616,7 +616,7 @@ contract RingV4JitHookTest is Test {
     function test_InitializeRejectsNativeAndDuplicatePool() public {
         MockFewFactory otherFew = new MockFewFactory();
         bytes memory args = abi.encode(pm, otherFew, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 300_000);
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 10_000_000);
         RingV4JitHook other = new RingV4JitHook{salt: salt}(pm, otherFew, address(this));
         PoolKey memory candidate = key;
         candidate.hooks = IHooks(address(other));

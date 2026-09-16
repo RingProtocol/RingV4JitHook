@@ -92,7 +92,7 @@ contract RingV4JitHookForkTest is Test {
         // 4. Deploy hook (CREATE2 mine for flags 0x20c0)
         // ------------------------------------------------------------------
         bytes memory args = abi.encode(pm, few, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 300_000);
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 10_000_000);
         hook = new RingV4JitHook{salt: salt}(pm, few, address(this));
 
         // ------------------------------------------------------------------

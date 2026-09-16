@@ -43,7 +43,7 @@ contract RingV4JitHookForkTest is Test {
     PoolModifyLiquidityTest lp;
 
     PoolKey key; // outer pool: WBTC/WETH with hook, fee=0, ts=60
-    PoolKey fbKey; // backend pool: FEW_WBTC/FEW_WETH hookless, fee=3000, ts=60
+    PoolKey lpKey; // backend pool: FEW_WBTC/FEW_WETH hookless, fee=3000, ts=60
 
     uint160 backendSqrtPrice;
 
@@ -67,8 +67,8 @@ contract RingV4JitHookForkTest is Test {
         // ------------------------------------------------------------------
         // 3. Seed backend pool (FEW_WBTC / FEW_WETH, fee=3000, ts=60)
         // ------------------------------------------------------------------
-        fbKey = PoolKey(Currency.wrap(FEW_WBTC), Currency.wrap(FEW_WETH), 3000, 60, IHooks(address(0)));
-        (backendSqrtPrice,,,) = pm.getSlot0(fbKey.toId());
+        lpKey = PoolKey(Currency.wrap(FEW_WBTC), Currency.wrap(FEW_WETH), 3000, 60, IHooks(address(0)));
+        (backendSqrtPrice,,,) = pm.getSlot0(lpKey.toId());
         assertGt(backendSqrtPrice, 0, "backend pool not initialized");
 
         // Wrap raw tokens to FewWrapped tokens
@@ -81,7 +81,7 @@ contract RingV4JitHookForkTest is Test {
         IERC20(FEW_WBTC).approve(address(lp), type(uint256).max);
         IERC20(FEW_WETH).approve(address(lp), type(uint256).max);
         lp.modifyLiquidity(
-            fbKey,
+            lpKey,
             ModifyLiquidityParams(
                 TickMath.minUsableTick(60), TickMath.maxUsableTick(60), int256(uint256(1e14)), bytes32(0)
             ),
@@ -89,24 +89,24 @@ contract RingV4JitHookForkTest is Test {
         );
 
         // ------------------------------------------------------------------
-        // 4. Deploy hook (CREATE2 mine for flags 0x2ac0)
+        // 4. Deploy hook (CREATE2 mine for flags 0x28c0)
         // ------------------------------------------------------------------
         bytes memory args = abi.encode(pm, few, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x2ac0, 300_000);
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x28c0, 300_000);
         hook = new RingV4JitHook{salt: salt}(pm, few, address(this));
 
         // ------------------------------------------------------------------
         // 5. Initialize outer pool (WBTC/WETH, fee=0, ts=60, hook)
         // ------------------------------------------------------------------
         key = PoolKey(Currency.wrap(WBTC), Currency.wrap(WETH), 0, 60, IHooks(address(hook)));
-        hook.initializePool(key, backendSqrtPrice);
+        pm.initialize(key, backendSqrtPrice);
 
         // ------------------------------------------------------------------
         // 6. Configure backend route
         // ------------------------------------------------------------------
-        hook.setFbPool(key, fbKey);
-        assertTrue(hook.getFbPool(key).set);
-        assertTrue(hook.getFbPool(key).orderAligned, "wrapper ordering should be aligned");
+        hook.setLpPool(key, lpKey);
+        assertTrue(hook.getLpPool(key).set);
+        assertTrue(hook.getLpPool(key).orderAligned, "wrapper ordering should be aligned");
 
         // ------------------------------------------------------------------
         // 7. Fund rounding buffers (MIN_BUFFER = 16)
@@ -133,8 +133,8 @@ contract RingV4JitHookForkTest is Test {
         // ------------------------------------------------------------------
         // 9. Set pool live
         // ------------------------------------------------------------------
-        hook.setPoolLive(true);
-        assertTrue(hook.live());
+        hook.setPoolLive(key, true);
+        assertTrue(hook.poolLive(key.toId()));
 
         // ------------------------------------------------------------------
         // 10. Approve router
@@ -172,12 +172,12 @@ contract RingV4JitHookForkTest is Test {
         Hooks.Permissions memory p = hook.getHookPermissions();
         assertTrue(p.beforeInitialize);
         assertTrue(p.beforeAddLiquidity);
-        assertTrue(p.beforeRemoveLiquidity);
+        assertFalse(p.beforeRemoveLiquidity);
         assertTrue(p.beforeSwap);
         assertTrue(p.afterSwap);
         assertFalse(p.beforeSwapReturnDelta);
         assertFalse(p.afterSwapReturnDelta);
-        assertEq(uint160(address(hook)) & 0x3FFF, 0x2AC0);
+        assertEq(uint160(address(hook)) & 0x3FFF, 0x28C0);
         assertEq(hook.MAX_ROUNDING_LOSS(), 8);
         assertEq(hook.MAX_SPOT_DEVIATION_BPS(), 500);
         assertEq(hook.MIN_BUFFER(), 16);
@@ -313,9 +313,9 @@ contract RingV4JitHookForkTest is Test {
         address outsider = address(0xBEEF);
         vm.startPrank(outsider);
         vm.expectRevert();
-        hook.setFbPool(key, fbKey);
+        hook.setLpPool(key, lpKey);
         vm.expectRevert();
-        hook.setPoolLive(false);
+        hook.setPoolLive(key, false);
         vm.expectRevert();
         hook.fundRounding(key.currency0, 1);
         vm.expectRevert();
@@ -342,8 +342,8 @@ contract RingV4JitHookForkTest is Test {
     }
 
     function _backendStateHash() internal view returns (bytes32) {
-        (uint160 price, int24 tick, uint24 protocolFee, uint24 lpFee) = pm.getSlot0(fbKey.toId());
-        return keccak256(abi.encode(price, tick, protocolFee, lpFee, pm.getLiquidity(fbKey.toId())));
+        (uint160 price, int24 tick, uint24 protocolFee, uint24 lpFee) = pm.getSlot0(lpKey.toId());
+        return keccak256(abi.encode(price, tick, protocolFee, lpFee, pm.getLiquidity(lpKey.toId())));
     }
 
     /// @dev Required to receive ETH refunds from PoolModifyLiquidityTest.

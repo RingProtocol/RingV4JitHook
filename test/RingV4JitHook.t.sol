@@ -110,7 +110,7 @@ contract RingV4JitHookTest is Test {
     PoolModifyLiquidityTest lp;
     FewV4QuoteHarness quoter;
     PoolKey key;
-    PoolKey fbKey;
+    PoolKey lpKey;
     address a;
     address b;
     address fwA;
@@ -118,7 +118,7 @@ contract RingV4JitHookTest is Test {
     uint256[4] donated;
 
     function _defensiveWrappers() internal returns (DefensiveFewWrappedToken input, DefensiveFewWrappedToken output) {
-        _fullRange(fbKey, -int256(uint256(BACKEND_LIQUIDITY)));
+        _fullRange(lpKey, -int256(uint256(BACKEND_LIQUIDITY)));
         input = new DefensiveFewWrappedToken(a);
         output = new DefensiveFewWrappedToken(b);
         fwA = address(input);
@@ -131,10 +131,10 @@ contract RingV4JitHookTest is Test {
         output.wrap(100_000 ether);
         _approve(fwA);
         _approve(fwB);
-        fbKey = _backendKey(3000, 60);
-        pm.initialize(fbKey, Q96);
-        _fullRange(fbKey, int256(uint256(BACKEND_LIQUIDITY)));
-        hook.setFbPool(key, fbKey);
+        lpKey = _backendKey(3000, 60);
+        pm.initialize(lpKey, Q96);
+        _fullRange(lpKey, int256(uint256(BACKEND_LIQUIDITY)));
+        hook.setLpPool(key, lpKey);
     }
 
     function setUp() public {
@@ -168,21 +168,21 @@ contract RingV4JitHookTest is Test {
         _approve(b);
         _approve(fwA);
         _approve(fwB);
-        fbKey = _backendKey(3000, 60);
-        pm.initialize(fbKey, Q96);
-        _fullRange(fbKey, int256(uint256(BACKEND_LIQUIDITY)));
+        lpKey = _backendKey(3000, 60);
+        pm.initialize(lpKey, Q96);
+        _fullRange(lpKey, int256(uint256(BACKEND_LIQUIDITY)));
         bytes memory args = abi.encode(pm, few, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x2ac0, 300_000);
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x28c0, 300_000);
         hook = new RingV4JitHook{salt: salt}(pm, few, address(this));
         key = PoolKey(Currency.wrap(a), Currency.wrap(b), 0, 60, IHooks(address(hook)));
-        hook.initializePool(key, Q96);
-        hook.setFbPool(key, fbKey);
+        pm.initialize(key, Q96);
+        hook.setLpPool(key, lpKey);
         IERC20(a).approve(address(hook), type(uint256).max);
         IERC20(b).approve(address(hook), type(uint256).max);
         hook.fundRounding(key.currency0, 1_000_000);
         hook.fundRounding(key.currency1, 1_000_000);
         _fullRange(key, int256(uint256(BASE_LIQUIDITY)));
-        hook.setPoolLive(true);
+        hook.setPoolLive(key, true);
     }
 
     function _approve(address token) internal {
@@ -210,7 +210,7 @@ contract RingV4JitHookTest is Test {
     }
 
     function _backendSwap(bool forward, int256 specified) internal returns (BalanceDelta) {
-        return backendRouter.swap(fbKey, _params(forward, specified), PoolSwapTest.TestSettings(false, false), "");
+        return backendRouter.swap(lpKey, _params(forward, specified), PoolSwapTest.TestSettings(false, false), "");
     }
 
     function _poolState(PoolKey memory pool) internal view returns (bytes32) {
@@ -222,7 +222,7 @@ contract RingV4JitHookTest is Test {
         result = keccak256(
             abi.encode(
                 _poolState(key),
-                _poolState(fbKey),
+                _poolState(lpKey),
                 hook.roundingReserve(key.currency0),
                 hook.roundingReserve(key.currency1)
             )
@@ -281,7 +281,7 @@ contract RingV4JitHookTest is Test {
             }
             if (
                 logs[i].topics[0] == keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)")
-                    && logs[i].topics[1] == PoolId.unwrap(fbKey.toId())
+                    && logs[i].topics[1] == PoolId.unwrap(lpKey.toId())
             ) ++backendSwaps;
         }
         assertEq(modifications, p.liquidity == 0 ? 0 : 2);
@@ -306,7 +306,7 @@ contract RingV4JitHookTest is Test {
         s.reserve1 = hook.roundingReserve(key.currency1);
         s.backendIn = IERC20(forward ? fwA : fwB).balanceOf(address(pm));
         s.backendOut = IERC20(forward ? fwB : fwA).balanceOf(address(pm));
-        s.backendState = _poolState(fbKey);
+        s.backendState = _poolState(lpKey);
     }
 
     function _trade(bool forward, bool exactInput, uint256 size) internal {
@@ -332,8 +332,8 @@ contract RingV4JitHookTest is Test {
         assertLe(s.reserve1 - hook.roundingReserve(key.currency1), 8);
         (uint160 end,,,) = pm.getSlot0(key.toId());
         assertEq(end, p.end);
-        if (p.liquidity == 0) assertEq(_poolState(fbKey), s.backendState);
-        else assertNotEq(_poolState(fbKey), s.backendState);
+        if (p.liquidity == 0) assertEq(_poolState(lpKey), s.backendState);
+        else assertNotEq(_poolState(lpKey), s.backendState);
         _assertSettled();
     }
 
@@ -394,7 +394,7 @@ contract RingV4JitHookTest is Test {
                     target = address(hook);
                     if (action == 2) {
                         PoolKey memory empty;
-                        data = abi.encodeCall(hook.setFbPool, (key, empty));
+                        data = abi.encodeCall(hook.setLpPool, (key, empty));
                     } else {
                         data = abi.encodeCall(hook.withdrawRounding, (key.currency0, uint256(100), address(caller)));
                     }
@@ -405,7 +405,7 @@ contract RingV4JitHookTest is Test {
                 _trade(true, true, 1 ether);
                 assertEq(caller.callbackAttempts(), 1);
                 assertEq(caller.callbackSuccesses(), 0);
-                assertTrue(hook.getFbPool(key).set);
+                assertTrue(hook.getLpPool(key).set);
                 assertTrue(vm.revertToState(snapshot));
             }
         }
@@ -417,15 +417,15 @@ contract RingV4JitHookTest is Test {
             uint256 snapshot = vm.snapshotState();
             bytes memory data;
             if (action == 0) {
-                data = abi.encodeCall(pm.swap, (fbKey, _params(fwA < fwB, -int256(10 ether)), bytes("")));
+                data = abi.encodeCall(pm.swap, (lpKey, _params(fwA < fwB, -int256(10 ether)), bytes("")));
             } else {
                 data = abi.encodeCall(
                     pm.modifyLiquidity,
                     (
-                        fbKey,
+                        lpKey,
                         ModifyLiquidityParams(
-                            TickMath.minUsableTick(fbKey.tickSpacing),
-                            TickMath.maxUsableTick(fbKey.tickSpacing),
+                            TickMath.minUsableTick(lpKey.tickSpacing),
+                            TickMath.maxUsableTick(lpKey.tickSpacing),
                             int256(1000 ether),
                             bytes32(uint256(71))
                         ),
@@ -441,13 +441,13 @@ contract RingV4JitHookTest is Test {
             router.swap(key, _params(true, -int256(1 ether)), p.amountOut, block.timestamp);
             assertEq(_state(), beforeState);
             assertEq(input.callbackAttempts(), 0);
-            assertEq(pm.currencyDelta(address(input), fbKey.currency0), 0);
-            assertEq(pm.currencyDelta(address(input), fbKey.currency1), 0);
+            assertEq(pm.currencyDelta(address(input), lpKey.currency0), 0);
+            assertEq(pm.currencyDelta(address(input), lpKey.currency1), 0);
             (uint128 mutatedPosition,,) = pm.getPositionInfo(
-                fbKey.toId(),
+                lpKey.toId(),
                 address(input),
-                TickMath.minUsableTick(fbKey.tickSpacing),
-                TickMath.maxUsableTick(fbKey.tickSpacing),
+                TickMath.minUsableTick(lpKey.tickSpacing),
+                TickMath.maxUsableTick(lpKey.tickSpacing),
                 bytes32(uint256(71))
             );
             assertEq(mutatedPosition, 0);
@@ -482,7 +482,7 @@ contract RingV4JitHookTest is Test {
     }
 
     function test_AlignedFourModesAndRealBackendSwap() public {
-        assertTrue(hook.getFbPool(key).orderAligned);
+        assertTrue(hook.getLpPool(key).orderAligned);
         (uint256 ringIn, uint256 ringOut, RingLPPlanner.Plan memory p) = hook.quote(key, true, -int256(1 ether));
         assertGt(p.liquidity, 0);
         assertGt(ringIn, 0);
@@ -495,7 +495,7 @@ contract RingV4JitHookTest is Test {
 
     function test_InvertedFourModesAndRealBackendSwap() public {
         _fixture(false);
-        assertFalse(hook.getFbPool(key).orderAligned);
+        assertFalse(hook.getLpPool(key).orderAligned);
         (,, RingLPPlanner.Plan memory p) = hook.quote(key, true, -int256(1 ether));
         assertGt(p.liquidity, 0);
         _trade(true, true, 1 ether);
@@ -521,7 +521,7 @@ contract RingV4JitHookTest is Test {
 
     function test_BackendDirectionalProtocolFeesIncludedInJIT() public {
         manager.setProtocolFeeController(address(this));
-        manager.setProtocolFee(fbKey, uint24(500 | (1000 << 12)));
+        manager.setProtocolFee(lpKey, uint24(500 | (1000 << 12)));
         (,, RingLPPlanner.Plan memory p) = hook.quote(key, true, -int256(1 ether));
         assertGt(p.liquidity, 0);
         _trade(true, true, 1 ether);
@@ -536,9 +536,10 @@ contract RingV4JitHookTest is Test {
 
     function test_PermissionsAndConstants() public view {
         Hooks.Permissions memory p = hook.getHookPermissions();
-        assertTrue(p.beforeInitialize && p.beforeAddLiquidity && p.beforeRemoveLiquidity && p.beforeSwap && p.afterSwap);
+        assertTrue(p.beforeInitialize && p.beforeAddLiquidity && p.beforeSwap && p.afterSwap);
+        assertFalse(p.beforeRemoveLiquidity);
         assertFalse(p.beforeSwapReturnDelta || p.afterSwapReturnDelta);
-        assertEq(uint160(address(hook)) & 0x3fff, 0x2ac0);
+        assertEq(uint160(address(hook)) & 0x3fff, 0x28c0);
         assertEq(hook.MAX_ROUNDING_LOSS(), 8);
         assertEq(hook.MAX_SPOT_DEVIATION_BPS(), 500);
     }
@@ -547,13 +548,13 @@ contract RingV4JitHookTest is Test {
         PoolKey memory replacement = _backendKey(500, 10);
         pm.initialize(replacement, Q96);
         _fullRange(replacement, int256(uint256(BACKEND_LIQUIDITY)));
-        hook.setFbPool(key, replacement);
-        assertEq(PoolId.unwrap(hook.getFbPool(key).fbPoolKey.toId()), PoolId.unwrap(replacement.toId()));
-        fbKey = replacement;
+        hook.setLpPool(key, replacement);
+        assertEq(PoolId.unwrap(hook.getLpPool(key).lpPoolKey.toId()), PoolId.unwrap(replacement.toId()));
+        lpKey = replacement;
         _trade(true, true, 1 ether);
         PoolKey memory empty;
-        hook.setFbPool(key, empty);
-        assertFalse(hook.getFbPool(key).set);
+        hook.setLpPool(key, empty);
+        assertFalse(hook.getLpPool(key).set);
         assertEq(hook.getIndicativeQuote(key, true, -int256(1 ether), ""), 0);
         vm.expectRevert();
         hook.quote(key, true, -int256(1 ether));
@@ -565,19 +566,19 @@ contract RingV4JitHookTest is Test {
         PoolKey[] memory backing = new PoolKey[](1);
         current[0] = key;
         backing[0] = replacement;
-        hook.setFbPools(current, backing);
-        assertTrue(hook.getFbPool(key).set);
+        hook.setLpPools(current, backing);
+        assertTrue(hook.getLpPool(key).set);
         backing = new PoolKey[](0);
         vm.expectRevert();
-        hook.setFbPools(current, backing);
-        assertTrue(hook.getFbPool(key).set);
+        hook.setLpPools(current, backing);
+        assertTrue(hook.getLpPool(key).set);
     }
 
     function test_NativeBackendCurrencyZeroRemovesWithoutRouteInference() public {
-        PoolKey memory nativeRoute = fbKey;
+        PoolKey memory nativeRoute = lpKey;
         nativeRoute.currency0 = Currency.wrap(address(0));
-        hook.setFbPool(key, nativeRoute);
-        assertFalse(hook.getFbPool(key).set);
+        hook.setLpPool(key, nativeRoute);
+        assertFalse(hook.getLpPool(key).set);
         bytes32 beforeState = _state();
         vm.expectRevert();
         hook.quote(key, true, -int256(1 ether));
@@ -601,16 +602,14 @@ contract RingV4JitHookTest is Test {
         PoolKey[] memory current = new PoolKey[](1);
         PoolKey[] memory backing = new PoolKey[](1);
         current[0] = key;
-        backing[0] = fbKey;
+        backing[0] = lpKey;
         vm.startPrank(outsider);
         vm.expectRevert();
-        hook.setFbPool(key, fbKey);
+        hook.setLpPool(key, lpKey);
         vm.expectRevert();
-        hook.setFbPools(current, backing);
+        hook.setLpPools(current, backing);
         vm.expectRevert();
-        hook.initializePool(key, Q96);
-        vm.expectRevert();
-        hook.setPoolLive(false);
+        hook.setPoolLive(key, false);
         vm.expectRevert();
         hook.fundRounding(key.currency0, 1);
         vm.expectRevert();
@@ -628,72 +627,70 @@ contract RingV4JitHookTest is Test {
         current[0] = key;
         current[1] = key;
         current[1].tickSpacing = 1;
-        backing[1] = fbKey;
+        backing[1] = lpKey;
         vm.expectRevert();
-        hook.setFbPools(current, backing);
-        assertTrue(hook.getFbPool(key).set);
-        assertEq(PoolId.unwrap(hook.getFbPool(key).fbPoolKey.toId()), PoolId.unwrap(fbKey.toId()));
+        hook.setLpPools(current, backing);
+        assertTrue(hook.getLpPool(key).set);
+        assertEq(PoolId.unwrap(hook.getLpPool(key).lpPoolKey.toId()), PoolId.unwrap(lpKey.toId()));
     }
 
     function test_InitializeRejectsNativeNonzeroFeeAndDuplicatePool() public {
         MockFewFactory otherFew = new MockFewFactory();
         bytes memory args = abi.encode(pm, otherFew, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x2ac0, 300_000);
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x28c0, 300_000);
         RingV4JitHook other = new RingV4JitHook{salt: salt}(pm, otherFew, address(this));
         PoolKey memory candidate = key;
         candidate.hooks = IHooks(address(other));
         candidate.currency0 = Currency.wrap(address(0));
         vm.expectRevert();
-        other.initializePool(candidate, Q96);
+        pm.initialize(candidate, Q96);
         candidate.currency0 = key.currency0;
         candidate.fee = 3000;
         vm.expectRevert();
-        other.initializePool(candidate, Q96);
+        pm.initialize(candidate, Q96);
         candidate.fee = 0;
+        pm.initialize(candidate, Q96);
+        assertFalse(other.getLpPool(candidate).set);
+        vm.expectRevert();
+        other.setPoolLive(candidate, true);
         vm.expectRevert();
         pm.initialize(candidate, Q96);
-        other.initializePool(candidate, Q96);
-        assertFalse(other.getFbPool(candidate).set);
         vm.expectRevert();
-        other.setPoolLive(true);
-        vm.expectRevert();
-        other.initializePool(candidate, Q96);
-        vm.expectRevert();
-        hook.initializePool(key, Q96);
+        pm.initialize(key, Q96);
     }
 
     function test_UninitializedHookedDynamicNativeAndUnsortedRoutesRejected() public {
         PoolKey memory bad = _backendKey(500, 10);
         vm.expectRevert();
-        hook.setFbPool(key, bad);
-        bad = fbKey;
+        hook.setLpPool(key, bad);
+        bad = lpKey;
         bad.hooks = IHooks(address(hook));
         vm.expectRevert();
-        hook.setFbPool(key, bad);
-        bad = fbKey;
+        hook.setLpPool(key, bad);
+        bad = lpKey;
         bad.fee = 0x800000;
         vm.expectRevert();
-        hook.setFbPool(key, bad);
+        hook.setLpPool(key, bad);
         bad.fee = 1_000_000;
         vm.expectRevert();
-        hook.setFbPool(key, bad);
-        bad = fbKey;
+        hook.setLpPool(key, bad);
+        bad = lpKey;
         (bad.currency0, bad.currency1) = (bad.currency1, bad.currency0);
         vm.expectRevert();
-        hook.setFbPool(key, bad);
-        bad = fbKey;
+        hook.setLpPool(key, bad);
+        bad = lpKey;
         bad.currency1 = Currency.wrap(address(0));
         vm.expectRevert();
-        hook.setFbPool(key, bad);
+        hook.setLpPool(key, bad);
         PoolKey memory other = key;
         other.currency0 = Currency.wrap(address(0));
         vm.expectRevert();
-        hook.setFbPool(other, fbKey);
+        hook.setLpPool(other, lpKey);
         other = key;
         other.tickSpacing = 10;
         vm.expectRevert();
-        hook.setFbPool(other, fbKey);
-        assertEq(PoolId.unwrap(hook.getFbPool(key).fbPoolKey.toId()), PoolId.unwrap(fbKey.toId()));
+        hook.setLpPool(other, lpKey);
+        assertEq(PoolId.unwrap(hook.getLpPool(key).lpPoolKey.toId()), PoolId.unwrap(lpKey.toId()));
     }
 
     function test_WrongUnderlyingNoncanonicalAndRawOverlapRejected() public {
@@ -704,24 +701,24 @@ contract RingV4JitHookTest is Test {
         );
         pm.initialize(bad, Q96);
         vm.expectRevert();
-        hook.setFbPool(key, bad);
+        hook.setLpPool(key, bad);
         few.setWrapped(b, fwC);
         vm.expectRevert();
-        hook.setFbPool(key, bad);
+        hook.setLpPool(key, bad);
         few.setWrapped(b, address(new MockFewWrappedToken(b)));
         vm.expectRevert();
-        hook.setFbPool(key, fbKey);
+        hook.setLpPool(key, lpKey);
         few.setWrapped(b, fwB);
         bad = PoolKey(key.currency0, key.currency1, 3000, 60, IHooks(address(0)));
         pm.initialize(bad, Q96);
         few.setWrapped(a, a);
         few.setWrapped(b, b);
         vm.expectRevert();
-        hook.setFbPool(key, bad);
+        hook.setLpPool(key, bad);
     }
 
     function test_EmptyBackendFallsBackWithoutPartialBackendExecution() public {
-        _fullRange(fbKey, -int256(uint256(BACKEND_LIQUIDITY)));
+        _fullRange(lpKey, -int256(uint256(BACKEND_LIQUIDITY)));
         (uint256 ringIn, uint256 ringOut, RingLPPlanner.Plan memory p) = hook.quote(key, true, -int256(1 ether));
         assertEq(p.liquidity, 0);
         assertEq(ringIn, 0);
@@ -750,8 +747,8 @@ contract RingV4JitHookTest is Test {
     function test_InsufficientBackendDepthCannotPartiallyFillPromisedQuote() public {
         (,, RingLPPlanner.Plan memory promised) = hook.quote(key, true, -int256(10 ether));
         assertGt(promised.liquidity, 0);
-        _fullRange(fbKey, -int256(uint256(BACKEND_LIQUIDITY)));
-        _range(fbKey, -60, 60, 100 ether);
+        _fullRange(lpKey, -int256(uint256(BACKEND_LIQUIDITY)));
+        _range(lpKey, -60, 60, 100 ether);
         bytes32 beforeState = _state();
         vm.expectRevert();
         router.swap(key, _params(true, -int256(10 ether)), promised.amountOut, block.timestamp);
@@ -811,11 +808,11 @@ contract RingV4JitHookTest is Test {
         uint256 amount = forward
             ? SqrtPriceMath.getAmount0Delta(target, start, BASE_LIQUIDITY, true)
             : SqrtPriceMath.getAmount1Delta(start, target, BASE_LIQUIDITY, true);
-        bytes32 backendBefore = _poolState(fbKey);
+        bytes32 backendBefore = _poolState(lpKey);
         uint256 reserve0 = hook.roundingReserve(key.currency0);
         uint256 reserve1 = hook.roundingReserve(key.currency1);
         router.syncPrice(key, SwapParams(forward, -int256(amount), target), 1, block.timestamp);
-        assertEq(_poolState(fbKey), backendBefore);
+        assertEq(_poolState(lpKey), backendBefore);
         assertLe(reserve0 - hook.roundingReserve(key.currency0), 8);
         assertLe(reserve1 - hook.roundingReserve(key.currency1), 8);
         _assertSettled();
@@ -823,25 +820,23 @@ contract RingV4JitHookTest is Test {
 
     function test_DeviationGuardAndBaseOnlySync() public {
         _backendSwap(fwA < fwB, -int256(1000 ether));
-        (uint256 deviation, uint256 allowed) = hook.getSpotDeviationBps(true);
+        (uint256 deviation, uint256 allowed) = hook.getSpotDeviationBps(key, true);
         assertGt(deviation, allowed);
         assertEq(hook.getIndicativeQuote(key, true, -int256(1 ether), ""), 0);
         vm.expectRevert();
         hook.quote(key, true, -int256(1 ether));
-        (uint160 backendPrice,,,) = pm.getSlot0(fbKey.toId());
+        (uint160 backendPrice,,,) = pm.getSlot0(lpKey.toId());
         _syncTo(fwA < fwB ? backendPrice : uint160((uint256(1) << 192) / backendPrice));
-        (deviation, allowed) = hook.getSpotDeviationBps(true);
+        (deviation, allowed) = hook.getSpotDeviationBps(key, true);
         assertLe(deviation, allowed);
         _trade(true, true, 1 ether);
     }
 
-    function test_PauseBufferFullRangeAndProtocolFeeGuards() public {
-        hook.setPoolLive(false);
+    function test_PauseBufferAndProtocolFeeGuards() public {
+        hook.setPoolLive(key, false);
         vm.expectRevert();
         router.swap(key, _params(true, -int256(1 ether)), 1, block.timestamp);
-        hook.setPoolLive(true);
-        vm.expectRevert();
-        _range(key, -60, 60, 1 ether);
+        hook.setPoolLive(key, true);
         hook.withdrawRounding(key.currency0, 999_990, address(this));
         assertEq(hook.getIndicativeQuote(key, true, -int256(1 ether), ""), 0);
         vm.expectRevert();
@@ -855,28 +850,28 @@ contract RingV4JitHookTest is Test {
     }
 
     function test_BackendTickCrossingWithFeesUsesJIT() public {
-        _fullRange(fbKey, -int256(uint256(BACKEND_LIQUIDITY)));
-        _fullRange(fbKey, 1000 ether);
-        _range(fbKey, -60, 60, 100 ether);
+        _fullRange(lpKey, -int256(uint256(BACKEND_LIQUIDITY)));
+        _fullRange(lpKey, 1000 ether);
+        _range(lpKey, -60, 60, 100 ether);
         (,, RingLPPlanner.Plan memory p) = hook.quote(key, true, -int256(10 ether));
         assertGt(p.liquidity, 0);
         _trade(true, true, 10 ether);
-        (, int24 tick,,) = pm.getSlot0(fbKey.toId());
+        (, int24 tick,,) = pm.getSlot0(lpKey.toId());
         assertLt(tick, -60);
-        (uint256 fees0, uint256 fees1) = pm.getFeeGrowthGlobals(fbKey.toId());
+        (uint256 fees0, uint256 fees1) = pm.getFeeGrowthGlobals(lpKey.toId());
         assertGt(fees0 + fees1, 0);
-        assertEq(pm.getLiquidity(fbKey.toId()), 1000 ether);
+        assertEq(pm.getLiquidity(lpKey.toId()), 1000 ether);
     }
 
     function _compareQuote(bool forward, int256 specified) internal {
         bytes32 beforeState = _state();
-        (uint256 amountIn, uint256 amountOut, uint160 end) = quoter.quote(pm, fbKey, forward, specified);
+        (uint256 amountIn, uint256 amountOut, uint160 end) = quoter.quote(pm, lpKey, forward, specified);
         assertEq(_state(), beforeState);
         BalanceDelta delta = _backendSwap(forward, specified);
         assertEq(-int256(forward ? delta.amount0() : delta.amount1()), int256(amountIn));
         assertEq(int256(forward ? delta.amount1() : delta.amount0()), int256(amountOut));
         assertEq(specified < 0 ? amountIn : amountOut, uint256(specified < 0 ? -specified : specified));
-        (uint160 actual,,,) = pm.getSlot0(fbKey.toId());
+        (uint160 actual,,,) = pm.getSlot0(lpKey.toId());
         assertEq(actual, end);
         assertEq(pm.getNonzeroDeltaCount(), 0);
     }
@@ -891,39 +886,39 @@ contract RingV4JitHookTest is Test {
 
     function test_QuoterFourModesWithDirectionalProtocolFees() public {
         manager.setProtocolFeeController(address(this));
-        manager.setProtocolFee(fbKey, uint24(500 | (1000 << 12)));
+        manager.setProtocolFee(lpKey, uint24(500 | (1000 << 12)));
         _compareFourModes(10 ether);
     }
 
     function test_QuoterInitializedBoundaryStoredTickDiffersFromPrice() public {
-        _range(fbKey, -60, 60, 1000 ether);
+        _range(lpKey, -60, 60, 1000 ether);
         backendRouter.swap(
-            fbKey,
+            lpKey,
             SwapParams(true, -int256(100 ether), TickMath.getSqrtPriceAtTick(-60)),
             PoolSwapTest.TestSettings(false, false),
             ""
         );
-        (uint160 price, int24 tick,,) = pm.getSlot0(fbKey.toId());
+        (uint160 price, int24 tick,,) = pm.getSlot0(lpKey.toId());
         assertEq(price, TickMath.getSqrtPriceAtTick(-60));
         assertEq(tick, -61);
         _compareFourModes(1 ether);
     }
 
     function test_QuoterMultipleRangesAndGapAllModes() public {
-        _fullRange(fbKey, -int256(uint256(BACKEND_LIQUIDITY)));
-        _range(fbKey, -60, 60, 100 ether);
-        _range(fbKey, -600, -120, 1000 ether);
-        _range(fbKey, 120, 600, 1000 ether);
+        _fullRange(lpKey, -int256(uint256(BACKEND_LIQUIDITY)));
+        _range(lpKey, -60, 60, 100 ether);
+        _range(lpKey, -600, -120, 1000 ether);
+        _range(lpKey, 120, 600, 1000 ether);
         _compareFourModes(5 ether);
     }
 
     function test_QuoterRejectsInsufficientDepthInAllModes() public {
-        _fullRange(fbKey, -int256(uint256(BACKEND_LIQUIDITY)));
-        _range(fbKey, -60, 60, 100 ether);
+        _fullRange(lpKey, -int256(uint256(BACKEND_LIQUIDITY)));
+        _range(lpKey, -60, 60, 100 ether);
         for (uint256 i; i < 4; ++i) {
             bytes32 beforeState = _state();
             vm.expectRevert();
-            quoter.quote(pm, fbKey, i < 2, i % 2 == 0 ? -int256(10 ether) : int256(10 ether));
+            quoter.quote(pm, lpKey, i < 2, i % 2 == 0 ? -int256(10 ether) : int256(10 ether));
             assertEq(_state(), beforeState);
         }
     }

@@ -11,7 +11,7 @@ import {RingLPRouter} from "../src/routers/RingLPRouter.sol";
 import {IFewFactory} from "../src/interfaces/external/IFewFactory.sol";
 
 /// @notice Deploy `RingV4JitHook` and `RingLPRouter` to a live network.
-/// @dev    The hook address must carry the permission flags `0x2AC0` in its low
+/// @dev    The hook address must carry the permission flags `0x28C0` in its low
 ///         14 bits, so the script mines a CREATE2 salt against the broadcaster
 ///         address before deploying with `new{salt:}`.
 ///
@@ -25,7 +25,7 @@ import {IFewFactory} from "../src/interfaces/external/IFewFactory.sol";
 ///     --rpc-url $MAINNET_RPC_URL --private-key $PRIVATE_KEY --broadcast -vv
 contract Deploy is Script {
     /// @notice Required permission flags in the hook address low 14 bits.
-    uint160 internal constant REQUIRED_FLAGS = 0x2AC0;
+    uint160 internal constant REQUIRED_FLAGS = 0x28C0;
     uint160 internal constant FLAG_MASK = 0x3FFF;
 
     function run() public returns (address hook, address router) {
@@ -38,7 +38,7 @@ contract Deploy is Script {
         require(address(few).code.length > 0, "FEW_FACTORY_ADDR has no code");
 
         // ------------------------------------------------------------------
-        // 1. Mine a CREATE2 salt so the hook address carries the flags 0x2AC0.
+        // 1. Mine a CREATE2 salt so the hook address carries the flags 0x28C0.
         // ------------------------------------------------------------------
         bytes memory creationCode = type(RingV4JitHook).creationCode;
         bytes memory constructorArgs = abi.encode(manager, few, owner);

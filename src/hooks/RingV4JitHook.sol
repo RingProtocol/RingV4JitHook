@@ -32,16 +32,18 @@ import {jitLockFor, requireJITNotInProgress} from "../alf/types/JITLock.sol";
 /// @notice JIT-backed Uniswap v4 hook that sources real FewToken v4 liquidity for each swap.
 /// @dev
 ///  Example lifecycle for a user selling 0.5 ETH (currency0) to buy 1,000 USDC (currency1):
-///   1. Owner initializes the outer pool with ETH/USDC as currency0/currency1 and adds full-range LP.
+///   1. Anyone initializes an outer pool with ETH/USDC as currency0/currency1 via `poolManager.initialize`.
+///      The hook's `_beforeInitialize` validates and records the pool.
 ///   2. Owner sets a backend FewToken v4 pool with fwETH/fwUSDC whose raw tokens are ETH/USDC.
-///   3. A user calls `poolManager.swap` on the outer pool with `amountSpecified = -1_000e6`
+///   3. Owner adds liquidity to the outer pool and calls `setPoolLive(key, true)`.
+///   4. A user calls `poolManager.swap` on the outer pool with `amountSpecified = -1_000e6`
 ///      (exact output of 1,000 USDC) and `zeroForOne = true`.
-///   4. `_beforeSwap` is invoked: it quotes the backend, finds the JIT liquidity that makes
+///   5. `_beforeSwap` is invoked: it quotes the backend, finds the JIT liquidity that makes
 ///      the outer-pool cost match the backend quote, adds that JIT position, and prefunds the
 ///      1,000 USDC by wrapping ETH, swapping on the backend, and unwrapping the USDC.
-///   5. The outer v4 swap executes through the JIT + permanent liquidity, consuming ~0.5 ETH
+///   6. The outer v4 swap executes through the JIT + permanent liquidity, consuming ~0.5 ETH
 ///      and producing ~1,000 USDC in PoolManager deltas.
-///   6. `_afterSwap` removes the JIT position, validates the deltas, and resolves any small
+///   7. `_afterSwap` removes the JIT position, validates the deltas, and resolves any small
 ///      rounding remainder using `roundingReserve` (capped at MAX_ROUNDING_LOSS per currency).
 contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
@@ -58,11 +60,20 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     IFewFactory public immutable fewFactory;
     RingV4JitQuoter private immutable _quoter;
     address public immutable factory;
-    bool public initialized;
-    bool public live;
-    PoolId public configuredPoolId;
-    PoolKey private _key;
-    mapping(PoolId => FbPool) public fbPools;
+
+    /// @notice Array of all registered outer-pool IDs.
+    PoolId[] public poolIds;
+    /// @notice Maps a registered outer-pool ID to its PoolKey.
+    mapping(PoolId => PoolKey) public poolKeys;
+    /// @notice Whether an outer pool ID has been registered by `_beforeInitialize`.
+    mapping(PoolId => bool) public poolRegistered;
+    /// @notice Per-pool live flag; swaps are only accepted when `poolLive[poolId]` is true.
+    mapping(PoolId => bool) public poolLive;
+    /// @notice Tracks currencies that belong to at least one registered pool (for rounding admin).
+    mapping(Currency => bool) private _currencyRegistered;
+
+    /// @notice Per-pool backend FewToken v4 pool configuration.
+    mapping(PoolId => LpPool) public lpPools;
     mapping(Currency => uint256) public roundingReserve;
     RingLPPlanner.Plan private _active;
     uint256 private _balance0Before;
@@ -70,8 +81,8 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     uint256 private _activeDonationLimit;
     bool private _syncing;
 
-    struct FbPool {
-        PoolKey fbPoolKey;
+    struct LpPool {
+        PoolKey lpPoolKey;
         bool orderAligned;
         bool set;
     }
@@ -79,7 +90,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     error InvalidPool();
     error InvalidRoute();
     error PoolNotLive();
-    error FullRangeLiquidityOnly();
     error ProtocolFeeNotSupported();
     error InsufficientRoundingBuffer();
     error UnexpectedTokenDelta();
@@ -92,10 +102,10 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     error RenounceOwnershipDisabled();
 
     event PoolCreated(PoolId indexed poolId);
-    event LiveSet(bool live);
+    event LiveSet(PoolId indexed poolId, bool live);
     event RoundingFunded(Currency indexed currency, uint256 amount);
-    event FbPoolSet(PoolId indexed curPoolId, PoolKey fbPoolKey);
-    event FbPoolRemoved(PoolId indexed curPoolId);
+    event LpPoolSet(PoolId indexed curPoolId, PoolKey lpPoolKey);
+    event LpPoolRemoved(PoolId indexed curPoolId);
     event RingJitSwap(
         PoolId indexed poolId, bool zeroForOne, uint256 amountIn, uint256 amountOut, uint256 loss0, uint256 loss1
     );
@@ -120,54 +130,45 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     function getHookPermissions() public pure override returns (Hooks.Permissions memory p) {
         p.beforeInitialize = true;
         p.beforeAddLiquidity = true;
-        p.beforeRemoveLiquidity = true;
         p.beforeSwap = true;
         p.afterSwap = true;
     }
 
-    function initializePool(PoolKey calldata key, uint160 initialSqrtPriceX96) external onlyOwner idle nonReentrant {
-        if (
-            initialized || address(key.hooks) != address(this) || key.fee != 0 || key.tickSpacing <= 0
-                || key.tickSpacing > 200 || key.currency0.isAddressZero() || key.currency0 >= key.currency1
-                || Currency.unwrap(key.currency0).code.length == 0 || Currency.unwrap(key.currency1).code.length == 0
-        ) revert InvalidPool();
-        initialized = true;
-        configuredPoolId = key.toId();
-        _key = key;
-        poolManager.initialize(key, initialSqrtPriceX96);
-        emit PoolCreated(configuredPoolId);
+    function poolCount() external view returns (uint256) {
+        return poolIds.length;
     }
 
-    function setFbPool(PoolKey calldata curPoolKey, PoolKey calldata fbPoolKey) external onlyOwner idle nonReentrant {
-        _setFbPool(curPoolKey, fbPoolKey);
+    function setLpPool(PoolKey calldata curPoolKey, PoolKey calldata lpPoolKey) external onlyOwner idle nonReentrant {
+        _setLpPool(curPoolKey, lpPoolKey);
     }
 
-    function setFbPools(PoolKey[] calldata curPoolKeys, PoolKey[] calldata fbPoolKeys)
+    function setLpPools(PoolKey[] calldata curPoolKeys, PoolKey[] calldata lpPoolKeys)
         external
         onlyOwner
         idle
         nonReentrant
     {
-        if (curPoolKeys.length == 0 || curPoolKeys.length != fbPoolKeys.length) revert InvalidRoute();
+        if (curPoolKeys.length == 0 || curPoolKeys.length != lpPoolKeys.length) revert InvalidRoute();
         for (uint256 i; i < curPoolKeys.length; ++i) {
-            _setFbPool(curPoolKeys[i], fbPoolKeys[i]);
+            _setLpPool(curPoolKeys[i], lpPoolKeys[i]);
         }
     }
 
-    function getFbPool(PoolKey calldata key) external view returns (FbPool memory) {
-        return fbPools[key.toId()];
+    function getLpPool(PoolKey calldata key) external view returns (LpPool memory) {
+        return lpPools[key.toId()];
     }
 
-    function _setFbPool(PoolKey calldata curPoolKey, PoolKey calldata fbPoolKey) private {
+    function _setLpPool(PoolKey calldata curPoolKey, PoolKey calldata lpPoolKey) private {
         _requirePool(curPoolKey);
-        if (fbPoolKey.currency0.isAddressZero()) {
-            delete fbPools[configuredPoolId];
-            emit FbPoolRemoved(configuredPoolId);
+        PoolId curPoolId = curPoolKey.toId();
+        if (lpPoolKey.currency0.isAddressZero()) {
+            delete lpPools[curPoolId];
+            emit LpPoolRemoved(curPoolId);
             return;
         }
-        bool aligned = _validateFbPool(fbPoolKey);
-        fbPools[configuredPoolId] = FbPool(fbPoolKey, aligned, true);
-        emit FbPoolSet(configuredPoolId, fbPoolKey);
+        bool aligned = _validateLpPool(curPoolKey, lpPoolKey);
+        lpPools[curPoolId] = LpPool(lpPoolKey, aligned, true);
+        emit LpPoolSet(curPoolId, lpPoolKey);
     }
 
     function fundRounding(Currency currency, uint256 amount) external onlyOwner idle nonReentrant {
@@ -186,24 +187,31 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         currency.transfer(to, amount);
     }
 
-    function setPoolLive(bool enabled) external onlyOwner idle {
-        if (!initialized) revert InvalidPool();
+    function setPoolLive(PoolKey calldata key, bool enabled) external onlyOwner idle {
+        _requirePool(key);
+        PoolId poolId = key.toId();
         if (enabled) {
-            _route();
-            _requireBuffers();
-            _requireZeroFees();
-            if (poolManager.getLiquidity(configuredPoolId) == 0) revert UnexpectedLiquidity();
+            _route(poolId);
+            _requireBuffers(key);
+            _requireZeroFees(poolId);
+            if (poolManager.getLiquidity(poolId) == 0) revert UnexpectedLiquidity();
         }
-        live = enabled;
-        emit LiveSet(enabled);
+        poolLive[poolId] = enabled;
+        emit LiveSet(poolId, enabled);
     }
 
-    function getSpotDeviationBps(bool forward) external view idle returns (uint256 deviationBps, uint256 allowedBps) {
-        if (!initialized) revert InvalidPool();
-        FbPool memory fb = _route();
-        if (poolManager.getLiquidity(configuredPoolId) == 0) revert UnexpectedLiquidity();
-        (uint160 start,,,) = poolManager.getSlot0(configuredPoolId);
-        return _spotDeviationBps(start, forward, fb);
+    function getSpotDeviationBps(PoolKey calldata key, bool forward)
+        external
+        view
+        idle
+        returns (uint256 deviationBps, uint256 allowedBps)
+    {
+        _requirePool(key);
+        PoolId poolId = key.toId();
+        LpPool memory lp = _route(poolId);
+        if (poolManager.getLiquidity(poolId) == 0) revert UnexpectedLiquidity();
+        (uint160 start,,,) = poolManager.getSlot0(poolId);
+        return _spotDeviationBps(start, forward, lp);
     }
 
     function quote(PoolKey calldata key, bool zeroForOne, int256 amountSpecified)
@@ -242,45 +250,54 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         returns (uint256 ringIn, uint256 ringOut, RingLPPlanner.Plan memory p)
     {
         _requirePool(key);
-        if (!live) revert PoolNotLive();
-        _requireBuffers();
+        PoolId poolId = key.toId();
+        if (!poolLive[poolId]) revert PoolNotLive();
+        _requireBuffers(key);
         if (specified == 0 || specified == type(int256).min) revert UnexpectedFill();
         uint256 requested = SafeCast.toUint256(specified < 0 ? -specified : specified);
         if (requested > type(uint96).max) revert UnexpectedFill();
-        _requireZeroFees();
-        FbPool memory fb = _route();
-        uint128 baseLiquidity = poolManager.getLiquidity(configuredPoolId);
+        _requireZeroFees(poolId);
+        LpPool memory lp = _route(poolId);
+        uint128 baseLiquidity = poolManager.getLiquidity(poolId);
         if (baseLiquidity == 0) revert UnexpectedLiquidity();
-        (uint160 start,,,) = poolManager.getSlot0(configuredPoolId);
-        (ringIn, ringOut, p) = _findHybridPlan(start, baseLiquidity, specified, forward, key.tickSpacing, fb);
+        (uint160 start,,,) = poolManager.getSlot0(poolId);
+        (ringIn, ringOut, p) = _findHybridPlan(start, baseLiquidity, specified, forward, key.tickSpacing, lp);
         if (p.liquidity == 0) {
-            (uint256 deviationBps, uint256 allowedBps) = _spotDeviationBps(start, forward, fb);
+            (uint256 deviationBps, uint256 allowedBps) = _spotDeviationBps(start, forward, lp);
             if (deviationBps > allowedBps) revert QuoteDeviationExceeded();
         }
     }
 
-    function _beforeInitialize(address, PoolKey calldata, uint160) internal pure override returns (bytes4) {
-        revert InvalidPool();
+    /// @notice Hook entry point before pool initialization. Validates and registers the pool.
+    /// @dev
+    ///  Validates that the pool key meets the hook's requirements (hooks == this, fee == 0,
+    ///  valid tick spacing, non-native sorted ERC20 currencies). On success, records the
+    ///  poolId in `poolIds`, stores the key in `poolKeys`, marks `poolRegistered`, and
+    ///  registers both currencies. Reverts `InvalidPool` on validation failure or duplicate.
+    function _beforeInitialize(address, PoolKey calldata key, uint160) internal override returns (bytes4) {
+        if (
+            address(key.hooks) != address(this) || key.fee != 0 || key.tickSpacing <= 0 || key.tickSpacing > 200
+                || key.currency0.isAddressZero() || key.currency0 >= key.currency1
+                || Currency.unwrap(key.currency0).code.length == 0 || Currency.unwrap(key.currency1).code.length == 0
+        ) revert InvalidPool();
+        PoolId poolId = key.toId();
+        if (poolRegistered[poolId]) revert InvalidPool();
+        poolRegistered[poolId] = true;
+        poolKeys[poolId] = key;
+        poolIds.push(poolId);
+        _currencyRegistered[key.currency0] = true;
+        _currencyRegistered[key.currency1] = true;
+        emit PoolCreated(poolId);
+        return IHooks.beforeInitialize.selector;
     }
 
-    function _beforeAddLiquidity(address, PoolKey calldata key, ModifyLiquidityParams calldata params, bytes calldata)
+    function _beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
         internal
         view
         override
         returns (bytes4)
     {
-        _requireFullRange(key, params);
         return IHooks.beforeAddLiquidity.selector;
-    }
-
-    function _beforeRemoveLiquidity(
-        address,
-        PoolKey calldata key,
-        ModifyLiquidityParams calldata params,
-        bytes calldata
-    ) internal view override returns (bytes4) {
-        _requireFullRange(key, params);
-        return IHooks.beforeRemoveLiquidity.selector;
     }
 
     /// @notice Hook entry point before the outer swap.
@@ -298,11 +315,12 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         _requirePool(key);
-        jitLockFor(configuredPoolId).enter();
-        _requireZeroFees();
+        PoolId poolId = key.toId();
+        jitLockFor(poolId).enter();
+        _requireZeroFees(poolId);
         if (hookData.length == 32 && abi.decode(hookData, (bytes32)) == SYNC_SWAP) {
-            if (!live) revert PoolNotLive();
-            _route();
+            if (!poolLive[poolId]) revert PoolNotLive();
+            _route(poolId);
             _syncing = true;
             return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
         }
@@ -317,9 +335,9 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         _balance1Before = key.currency1.balanceOfSelf();
         _active = p;
         _activeDonationLimit =
-            p.liquidity == 0 ? MAX_ROUNDING_LOSS : _inputQuantum(_route(), params.zeroForOne, ringOut);
+            p.liquidity == 0 ? MAX_ROUNDING_LOSS : _inputQuantum(_route(poolId), params.zeroForOne, ringOut);
         if (p.liquidity != 0) {
-            _execute(params.zeroForOne, ringIn, ringOut);
+            _execute(key, params.zeroForOne, ringIn, ringOut);
             poolManager.modifyLiquidity(
                 key, ModifyLiquidityParams(p.lower, p.upper, int256(uint256(p.liquidity)), LP_SALT), ""
             );
@@ -346,14 +364,15 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         returns (bytes4, int128)
     {
         _requirePool(key);
+        PoolId poolId = key.toId();
         if (_syncing) {
             int128 syncInput = params.zeroForOne ? delta.amount0() : delta.amount1();
             int128 syncOutput = params.zeroForOne ? delta.amount1() : delta.amount0();
             if (syncInput >= 0 || syncOutput <= 0) revert UnexpectedFill();
             delete _syncing;
-            jitLockFor(configuredPoolId).clear();
+            jitLockFor(poolId).clear();
             emit PriceSyncSwap(
-                configuredPoolId,
+                poolId,
                 params.zeroForOne,
                 SafeCast.toUint256(-int256(syncInput)),
                 SafeCast.toUint256(int256(syncOutput))
@@ -367,12 +386,12 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         if (int256(input) != -SafeCast.toInt256(p.amountIn) || int256(output) != SafeCast.toInt256(p.amountOut)) {
             revert UnexpectedFill();
         }
-        (uint160 end,,,) = poolManager.getSlot0(configuredPoolId);
+        (uint160 end,,,) = poolManager.getSlot0(poolId);
         if (end != p.end) revert UnexpectedFill();
         // Post-swap price limit: keep the outer pool price aligned with the backend
         // FewToken pool so a flash-loan cannot push it away from the backed reference.
-        FbPool memory fb = _route();
-        (uint256 deviationBps, uint256 allowedBps) = _spotDeviationBps(end, params.zeroForOne, fb);
+        LpPool memory lp = _route(poolId);
+        (uint256 deviationBps, uint256 allowedBps) = _spotDeviationBps(end, params.zeroForOne, lp);
         if (deviationBps > allowedBps) revert PriceLimitExceeded();
         if (p.liquidity != 0) {
             poolManager.modifyLiquidity(
@@ -382,13 +401,13 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         _donateCreditsThenResolve(key, params.zeroForOne);
         uint256 loss0 = _chargeRounding(key.currency0, _balance0Before);
         uint256 loss1 = _chargeRounding(key.currency1, _balance1Before);
-        if (poolManager.getLiquidity(configuredPoolId) == 0) revert UnexpectedLiquidity();
+        if (poolManager.getLiquidity(poolId) == 0) revert UnexpectedLiquidity();
         delete _active;
         delete _balance0Before;
         delete _balance1Before;
         delete _activeDonationLimit;
-        jitLockFor(configuredPoolId).clear();
-        emit RingJitSwap(configuredPoolId, params.zeroForOne, p.amountIn, p.amountOut, loss0, loss1);
+        jitLockFor(poolId).clear();
+        emit RingJitSwap(poolId, params.zeroForOne, p.amountIn, p.amountOut, loss0, loss1);
         return (IHooks.afterSwap.selector, 0);
     }
 
@@ -427,7 +446,7 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         int256 specified,
         bool forward,
         int24 spacing,
-        FbPool memory fb
+        LpPool memory lp
     ) private view returns (uint256 ringIn, uint256 ringOut, RingLPPlanner.Plan memory best) {
         uint256 maxJit = uint256(type(uint128).max) - baseLiquidity;
         uint256 candidate = uint256(baseLiquidity);
@@ -442,7 +461,7 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         uint256 upper;
         for (uint256 i; i < 32 && candidate <= maxJit; ++i) {
             try _quoter.hybridCandidate(
-                start, baseLiquidity, SafeCast.toUint128(candidate), specified, forward, spacing, fb
+                start, baseLiquidity, SafeCast.toUint128(candidate), specified, forward, spacing, lp
             ) returns (
                 uint256 ri, uint256 ro, RingLPPlanner.Plan memory p, int256 diff
             ) {
@@ -473,7 +492,7 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         for (uint256 i; i < 64 && lower + 1 < upper; ++i) {
             uint256 middle = lower + (upper - lower) / 2;
             try _quoter.hybridCandidate(
-                start, baseLiquidity, SafeCast.toUint128(middle), specified, forward, spacing, fb
+                start, baseLiquidity, SafeCast.toUint128(middle), specified, forward, spacing, lp
             ) returns (
                 uint256 ri, uint256 ro, RingLPPlanner.Plan memory p, int256 diff
             ) {
@@ -494,7 +513,7 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
                 upper = middle;
             }
         }
-        if (surplus.liquidity != 0 && surplusDifference <= _inputQuantum(fb, forward, surplusRingOut)) {
+        if (surplus.liquidity != 0 && surplusDifference <= _inputQuantum(lp, forward, surplusRingOut)) {
             (ringIn, ringOut, best) = (surplusRingIn, surplusRingOut, surplus);
         } else if (best.liquidity == 0 || bestDifference > MAX_ROUNDING_LOSS) {
             (best.end, best.amountIn, best.amountOut) =
@@ -511,15 +530,15 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     /// @dev Example: backend needs 0.5004 ETH for 1_000 USDC and 0.5004005 for 1_001 USDC,
     ///  so the quantum is ~0.0000005 ETH + 8. It is used to accept a small surplus in
     ///  `_findHybridPlan`.
-    function inputQuantum(FbPool calldata fb, bool forward, uint256 output) external view returns (uint256) {
+    function inputQuantum(LpPool calldata lp, bool forward, uint256 output) external view returns (uint256) {
         if (msg.sender != address(this)) revert InvalidPool();
-        (uint256 current,,) = _quoter.quote(fb.fbPoolKey, forward == fb.orderAligned, SafeCast.toInt256(output));
-        (uint256 next,,) = _quoter.quote(fb.fbPoolKey, forward == fb.orderAligned, SafeCast.toInt256(output + 1));
+        (uint256 current,,) = _quoter.quote(lp.lpPoolKey, forward == lp.orderAligned, SafeCast.toInt256(output));
+        (uint256 next,,) = _quoter.quote(lp.lpPoolKey, forward == lp.orderAligned, SafeCast.toInt256(output + 1));
         return next - current + MAX_ROUNDING_LOSS;
     }
 
-    function _inputQuantum(FbPool memory fb, bool forward, uint256 output) private view returns (uint256) {
-        try this.inputQuantum(fb, forward, output) returns (uint256 quantum) {
+    function _inputQuantum(LpPool memory lp, bool forward, uint256 output) private view returns (uint256) {
+        try this.inputQuantum(lp, forward, output) returns (uint256 quantum) {
             return quantum;
         } catch {
             return MAX_ROUNDING_LOSS;
@@ -530,14 +549,14 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     /// @dev
     ///  Example: if the outer price is 5% higher than the backend, the returned deviation
     ///   is roughly 500 bps; it must not exceed `allowedBps` (500 bps + fee buffer).
-    function _spotDeviationBps(uint160 start, bool forward, FbPool memory fb)
+    function _spotDeviationBps(uint160 start, bool forward, LpPool memory lp)
         private
         view
         returns (uint256 deviationBps, uint256 allowedBps)
     {
-        (uint160 backend,, uint24 protocolFee, uint24 lpFee) = poolManager.getSlot0(fb.fbPoolKey.toId());
-        bool fbForward = forward == fb.orderAligned;
-        uint16 directionalFee = fbForward
+        (uint160 backend,, uint24 protocolFee, uint24 lpFee) = poolManager.getSlot0(lp.lpPoolKey.toId());
+        bool lpForward = forward == lp.orderAligned;
+        uint16 directionalFee = lpForward
             ? ProtocolFeeLibrary.getZeroForOneFee(protocolFee)
             : ProtocolFeeLibrary.getOneForZeroFee(protocolFee);
         uint24 fee = ProtocolFeeLibrary.calculateSwapFee(directionalFee, lpFee);
@@ -545,7 +564,7 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         allowedBps = MAX_SPOT_DEVIATION_BPS + (uint256(fee) + 99) / 100;
         uint256 q96 = 1 << 96;
         uint256 sqrtRatio;
-        if (fb.orderAligned) {
+        if (lp.orderAligned) {
             sqrtRatio = forward ? FullMath.mulDiv(start, q96, backend) : FullMath.mulDiv(backend, q96, start);
         } else if (forward) {
             sqrtRatio = FullMath.mulDiv(start, backend, q96);
@@ -557,15 +576,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         ratio = FullMath.mulDiv(ratio, 1_000_000, 1_000_000 - fee);
         uint256 difference = ratio > 1e18 ? ratio - 1e18 : 1e18 - ratio;
         deviationBps = FullMath.mulDivRoundingUp(difference, 10_000, 1e18);
-    }
-
-    function _requireFullRange(PoolKey calldata key, ModifyLiquidityParams calldata params) private view {
-        requireJITNotInProgress();
-        _requirePool(key);
-        if (
-            params.tickLower != TickMath.minUsableTick(key.tickSpacing)
-                || params.tickUpper != TickMath.maxUsableTick(key.tickSpacing)
-        ) revert FullRangeLiquidityOnly();
     }
 
     /// @notice Settles a negative delta or takes a positive delta, capping the amount.
@@ -594,49 +604,50 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     }
 
     function _requirePool(PoolKey calldata key) private view {
-        if (!initialized || PoolId.unwrap(key.toId()) != PoolId.unwrap(configuredPoolId)) revert InvalidPool();
+        if (!poolRegistered[key.toId()]) revert InvalidPool();
     }
 
     function _requireCurrency(Currency currency) private view {
-        if (!initialized || (!(currency == _key.currency0) && !(currency == _key.currency1))) revert InvalidPool();
+        if (!_currencyRegistered[currency]) revert InvalidPool();
     }
 
-    function _requireBuffers() private view {
-        if (roundingReserve[_key.currency0] < MIN_BUFFER || roundingReserve[_key.currency1] < MIN_BUFFER) {
+    function _requireBuffers(PoolKey calldata key) private view {
+        if (roundingReserve[key.currency0] < MIN_BUFFER || roundingReserve[key.currency1] < MIN_BUFFER) {
             revert InsufficientRoundingBuffer();
         }
     }
 
-    function _requireZeroFees() private view {
-        (,, uint24 protocolFee, uint24 lpFee) = poolManager.getSlot0(configuredPoolId);
+    function _requireZeroFees(PoolId poolId) private view {
+        (,, uint24 protocolFee, uint24 lpFee) = poolManager.getSlot0(poolId);
         if (protocolFee != 0 || lpFee != 0) revert ProtocolFeeNotSupported();
     }
 
-    function _route() private view returns (FbPool memory fb) {
-        fb = fbPools[configuredPoolId];
-        if (!fb.set || _validateFbPool(fb.fbPoolKey) != fb.orderAligned) revert InvalidRoute();
+    function _route(PoolId poolId) private view returns (LpPool memory lp) {
+        lp = lpPools[poolId];
+        if (!lp.set || _validateLpPool(poolKeys[poolId], lp.lpPoolKey) != lp.orderAligned) revert InvalidRoute();
     }
 
-    function _validateFbPool(PoolKey memory key) private view returns (bool aligned) {
+    function _validateLpPool(PoolKey memory curKey, PoolKey memory lpKey) private view returns (bool aligned) {
         if (
-            address(key.hooks) != address(0) || key.fee >= 1_000_000 || key.tickSpacing < TickMath.MIN_TICK_SPACING
-                || key.tickSpacing > TickMath.MAX_TICK_SPACING || key.currency0.isAddressZero()
-                || key.currency0 >= key.currency1 || key.currency0 == _key.currency0 || key.currency0 == _key.currency1
-                || key.currency1 == _key.currency0 || key.currency1 == _key.currency1
+            address(lpKey.hooks) != address(0) || lpKey.fee >= 1_000_000
+                || lpKey.tickSpacing < TickMath.MIN_TICK_SPACING || lpKey.tickSpacing > TickMath.MAX_TICK_SPACING
+                || lpKey.currency0.isAddressZero() || lpKey.currency0 >= lpKey.currency1
+                || lpKey.currency0 == curKey.currency0 || lpKey.currency0 == curKey.currency1
+                || lpKey.currency1 == curKey.currency0 || lpKey.currency1 == curKey.currency1
         ) revert InvalidRoute();
-        address fw0 = Currency.unwrap(key.currency0);
-        address fw1 = Currency.unwrap(key.currency1);
+        address fw0 = Currency.unwrap(lpKey.currency0);
+        address fw1 = Currency.unwrap(lpKey.currency1);
         if (fw0.code.length == 0 || fw1.code.length == 0) revert InvalidRoute();
         address raw0 = IFewWrappedToken(fw0).token();
         address raw1 = IFewWrappedToken(fw1).token();
-        if (raw0 == Currency.unwrap(_key.currency0) && raw1 == Currency.unwrap(_key.currency1)) {
+        if (raw0 == Currency.unwrap(curKey.currency0) && raw1 == Currency.unwrap(curKey.currency1)) {
             aligned = true;
-        } else if (raw0 != Currency.unwrap(_key.currency1) || raw1 != Currency.unwrap(_key.currency0)) {
+        } else if (raw0 != Currency.unwrap(curKey.currency1) || raw1 != Currency.unwrap(curKey.currency0)) {
             revert InvalidRoute();
         }
         if (fewFactory.getWrappedToken(raw0) != fw0 || fewFactory.getWrappedToken(raw1) != fw1) revert InvalidRoute();
-        (uint160 price,,, uint24 lpFee) = poolManager.getSlot0(key.toId());
-        if (price == 0 || lpFee != key.fee) revert InvalidRoute();
+        (uint160 price,,, uint24 lpFee) = poolManager.getSlot0(lpKey.toId());
+        if (price == 0 || lpFee != lpKey.fee) revert InvalidRoute();
     }
 
     function _requireDelta(Currency currency, int256 expected) private view {
@@ -652,16 +663,17 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     ///   4. Unwrap fwUSDC into raw USDC and settle it to PoolManager.
     ///   5. After this, the hook's PoolManager deltas are `-ringIn` input and `+ringOut`
     ///      output, matching the user-facing outer swap.
-    function _execute(bool forward, uint256 ringIn, uint256 ringOut) private {
-        FbPool memory fb = _route();
-        bool fbForward = forward == fb.orderAligned;
+    function _execute(PoolKey calldata key, bool forward, uint256 ringIn, uint256 ringOut) private {
+        PoolId poolId = key.toId();
+        LpPool memory lp = _route(poolId);
+        bool lpForward = forward == lp.orderAligned;
         (uint256 quotedIn, uint256 quotedOut, uint160 expectedEnd) =
-            _quoter.quote(fb.fbPoolKey, fbForward, SafeCast.toInt256(ringOut));
+            _quoter.quote(lp.lpPoolKey, lpForward, SafeCast.toInt256(ringOut));
         if (quotedIn != ringIn || quotedOut != ringOut) revert UnexpectedFill();
-        Currency input = forward ? _key.currency0 : _key.currency1;
-        Currency output = forward ? _key.currency1 : _key.currency0;
-        Currency fwInput = fbForward ? fb.fbPoolKey.currency0 : fb.fbPoolKey.currency1;
-        Currency fwOutput = fbForward ? fb.fbPoolKey.currency1 : fb.fbPoolKey.currency0;
+        Currency input = forward ? key.currency0 : key.currency1;
+        Currency output = forward ? key.currency1 : key.currency0;
+        Currency fwInput = lpForward ? lp.lpPoolKey.currency0 : lp.lpPoolKey.currency1;
+        Currency fwOutput = lpForward ? lp.lpPoolKey.currency1 : lp.lpPoolKey.currency0;
         _requireDelta(fwInput, 0);
         _requireDelta(fwOutput, 0);
         uint256 rawInBefore = input.balanceOfSelf();
@@ -678,16 +690,16 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
             revert UnexpectedTokenDelta();
         }
         BalanceDelta delta = poolManager.swap(
-            fb.fbPoolKey,
+            lp.lpPoolKey,
             SwapParams(
-                fbForward,
+                lpForward,
                 SafeCast.toInt256(ringOut),
-                fbForward ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+                lpForward ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
             ),
             ""
         );
-        int128 actualIn = fbForward ? delta.amount0() : delta.amount1();
-        int128 actualOut = fbForward ? delta.amount1() : delta.amount0();
+        int128 actualIn = lpForward ? delta.amount0() : delta.amount1();
+        int128 actualOut = lpForward ? delta.amount1() : delta.amount0();
         if (
             actualIn >= 0 || actualOut <= 0 || int256(actualIn) != -SafeCast.toInt256(ringIn)
                 || int256(actualOut) != SafeCast.toInt256(ringOut)
@@ -710,9 +722,9 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         _requireDelta(fwOutput, 0);
         _requireDelta(input, -SafeCast.toInt256(ringIn));
         _requireDelta(output, SafeCast.toInt256(ringOut));
-        (uint160 actualEnd,,,) = poolManager.getSlot0(fb.fbPoolKey.toId());
+        (uint160 actualEnd,,,) = poolManager.getSlot0(lp.lpPoolKey.toId());
         if (actualEnd != expectedEnd) revert UnexpectedFill();
-        _route();
+        _route(poolId);
     }
 }
 
@@ -730,7 +742,7 @@ contract RingV4JitQuoter {
         int256 specified,
         bool forward,
         int24 spacing,
-        RingV4JitHook.FbPool calldata fb
+        RingV4JitHook.LpPool calldata lp
     ) external view returns (uint256 ringIn, uint256 ringOut, RingLPPlanner.Plan memory p, int256 difference) {
         uint256 jitIn;
         uint256 jitOut;
@@ -738,7 +750,7 @@ contract RingV4JitQuoter {
             RingLPPlanner.planAtCurrent(start, baseLiquidity, jitLiquidity, specified, forward, spacing);
         if (jitOut == 0 || jitOut > type(uint96).max) revert RingV4JitHook.UnexpectedFill();
         (ringIn, ringOut,) =
-            FewV4Quoter.quote(_manager, fb.fbPoolKey, forward == fb.orderAligned, SafeCast.toInt256(jitOut));
+            FewV4Quoter.quote(_manager, lp.lpPoolKey, forward == lp.orderAligned, SafeCast.toInt256(jitOut));
         if (ringOut != jitOut || ringIn == 0 || ringIn > uint256(uint128(type(int128).max))) {
             revert RingV4JitHook.UnexpectedFill();
         }

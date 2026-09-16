@@ -613,7 +613,7 @@ contract RingV4JitHookTest is Test {
         assertEq(PoolId.unwrap(hook.getLpPool(key).lpPoolKey.toId()), PoolId.unwrap(lpKey.toId()));
     }
 
-    function test_InitializeRejectsNativeNonzeroFeeAndDuplicatePool() public {
+    function test_InitializeRejectsNativeAndDuplicatePool() public {
         MockFewFactory otherFew = new MockFewFactory();
         bytes memory args = abi.encode(pm, otherFew, address(this));
         (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 300_000);
@@ -624,10 +624,6 @@ contract RingV4JitHookTest is Test {
         vm.expectRevert();
         pm.initialize(candidate, Q96);
         candidate.currency0 = key.currency0;
-        candidate.fee = 3000;
-        vm.expectRevert();
-        pm.initialize(candidate, Q96);
-        candidate.fee = 0;
         pm.initialize(candidate, Q96);
         assertFalse(other.getLpPool(candidate).set);
         vm.expectRevert();
@@ -809,17 +805,12 @@ contract RingV4JitHookTest is Test {
         _trade(true, true, 1 ether);
     }
 
-    function test_BufferAndProtocolFeeGuards() public {
+    function test_BufferGuards() public {
         hook.withdrawRounding(key.currency0, 999_990, address(this));
         assertEq(hook.getIndicativeQuote(key, true, -int256(1 ether), ""), 0);
         vm.expectRevert();
         router.swap(key, _params(true, -int256(1 ether)), 1, block.timestamp);
         hook.fundRounding(key.currency0, 999_990);
-        manager.setProtocolFeeController(address(this));
-        manager.setProtocolFee(key, 1000);
-        assertEq(hook.getIndicativeQuote(key, true, -int256(1 ether), ""), 0);
-        vm.expectRevert();
-        router.swap(key, _params(true, -int256(1 ether)), 1, block.timestamp);
     }
 
     function test_BackendTickCrossingWithFeesUsesJIT() public {

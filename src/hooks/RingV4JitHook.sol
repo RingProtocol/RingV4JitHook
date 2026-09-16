@@ -82,7 +82,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
 
     error InvalidPool();
     error InvalidRoute();
-    error ProtocolFeeNotSupported();
     error InsufficientRoundingBuffer();
     error UnexpectedTokenDelta();
     error UnexpectedFill();
@@ -179,15 +178,13 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
 
     /// @notice Hook entry point before pool initialization. Validates and registers the pool.
     /// @dev
-    ///  Validates that the pool key meets the hook's requirements (hooks == this, fee == 0,
-    ///  valid tick spacing, non-native sorted ERC20 currencies). On success, records the
-    ///  poolId in `poolIds`, stores the key in `poolKeys`, and registers both
-    ///  currencies. Reverts `InvalidPool` on validation failure. Duplicate
-    ///  initialization is prevented by the PoolManager itself.
+    ///  Validates that the pool key meets the hook's requirements (hooks == this,
+    ///  sorted currencies with code). On success, records the poolId in `poolIds`,
+    ///  stores the key in `poolKeys`. Reverts `InvalidPool` on validation failure.
+    ///  Duplicate initialization is prevented by the PoolManager itself.
     function _beforeInitialize(address, PoolKey calldata key, uint160) internal override returns (bytes4) {
         if (
-            address(key.hooks) != address(this) || key.fee != 0 || key.tickSpacing <= 0 || key.tickSpacing > 200
-                || key.currency0.isAddressZero() || key.currency0 >= key.currency1
+            address(key.hooks) != address(this) || key.currency0 >= key.currency1
                 || Currency.unwrap(key.currency0).code.length == 0 || Currency.unwrap(key.currency1).code.length == 0
         ) revert InvalidPool();
         PoolId poolId = key.toId();
@@ -214,7 +211,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         _requirePool(key);
         PoolId poolId = key.toId();
         jitLockFor(poolId).enter();
-        _requireZeroFees(poolId);
         if (hookData.length == 32 && abi.decode(hookData, (bytes32)) == SYNC_SWAP) {
             _route(poolId);
             _syncing = true;
@@ -348,7 +344,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         if (specified == 0 || specified == type(int256).min) revert UnexpectedFill();
         uint256 requested = SafeCast.toUint256(specified < 0 ? -specified : specified);
         if (requested > type(uint96).max) revert UnexpectedFill();
-        _requireZeroFees(poolId);
         LpPool memory lp = _route(poolId);
         uint128 baseLiquidity = poolManager.getLiquidity(poolId);
         if (baseLiquidity == 0) revert UnexpectedLiquidity();
@@ -560,11 +555,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         if (roundingReserve[key.currency0] < MIN_BUFFER || roundingReserve[key.currency1] < MIN_BUFFER) {
             revert InsufficientRoundingBuffer();
         }
-    }
-
-    function _requireZeroFees(PoolId poolId) private view {
-        (,, uint24 protocolFee, uint24 lpFee) = poolManager.getSlot0(poolId);
-        if (protocolFee != 0 || lpFee != 0) revert ProtocolFeeNotSupported();
     }
 
     function _route(PoolId poolId) private view returns (LpPool memory lp) {

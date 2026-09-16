@@ -172,7 +172,7 @@ contract RingV4JitHookTest is Test {
         pm.initialize(lpKey, Q96);
         _fullRange(lpKey, int256(uint256(BACKEND_LIQUIDITY)));
         bytes memory args = abi.encode(pm, few, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x28c0, 300_000);
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 300_000);
         hook = new RingV4JitHook{salt: salt}(pm, few, address(this));
         key = PoolKey(Currency.wrap(a), Currency.wrap(b), 0, 60, IHooks(address(hook)));
         pm.initialize(key, Q96);
@@ -536,10 +536,10 @@ contract RingV4JitHookTest is Test {
 
     function test_PermissionsAndConstants() public view {
         Hooks.Permissions memory p = hook.getHookPermissions();
-        assertTrue(p.beforeInitialize && p.beforeAddLiquidity && p.beforeSwap && p.afterSwap);
-        assertFalse(p.beforeRemoveLiquidity);
+        assertTrue(p.beforeInitialize && p.beforeSwap && p.afterSwap);
+        assertFalse(p.beforeAddLiquidity || p.beforeRemoveLiquidity);
         assertFalse(p.beforeSwapReturnDelta || p.afterSwapReturnDelta);
-        assertEq(uint160(address(hook)) & 0x3fff, 0x28c0);
+        assertEq(uint160(address(hook)) & 0x3fff, 0x20c0);
         assertEq(hook.MAX_ROUNDING_LOSS(), 8);
         assertEq(hook.MAX_SPOT_DEVIATION_BPS(), 500);
     }
@@ -637,7 +637,7 @@ contract RingV4JitHookTest is Test {
     function test_InitializeRejectsNativeNonzeroFeeAndDuplicatePool() public {
         MockFewFactory otherFew = new MockFewFactory();
         bytes memory args = abi.encode(pm, otherFew, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x28c0, 300_000);
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 300_000);
         RingV4JitHook other = new RingV4JitHook{salt: salt}(pm, otherFew, address(this));
         PoolKey memory candidate = key;
         candidate.hooks = IHooks(address(other));

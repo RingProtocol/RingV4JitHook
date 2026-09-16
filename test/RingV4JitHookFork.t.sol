@@ -89,10 +89,10 @@ contract RingV4JitHookForkTest is Test {
         );
 
         // ------------------------------------------------------------------
-        // 4. Deploy hook (CREATE2 mine for flags 0x28c0)
+        // 4. Deploy hook (CREATE2 mine for flags 0x20c0)
         // ------------------------------------------------------------------
         bytes memory args = abi.encode(pm, few, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x28c0, 300_000);
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 300_000);
         hook = new RingV4JitHook{salt: salt}(pm, few, address(this));
 
         // ------------------------------------------------------------------
@@ -171,13 +171,13 @@ contract RingV4JitHookForkTest is Test {
     function test_ForkPermissionsAndConstants() public view {
         Hooks.Permissions memory p = hook.getHookPermissions();
         assertTrue(p.beforeInitialize);
-        assertTrue(p.beforeAddLiquidity);
+        assertFalse(p.beforeAddLiquidity);
         assertFalse(p.beforeRemoveLiquidity);
         assertTrue(p.beforeSwap);
         assertTrue(p.afterSwap);
         assertFalse(p.beforeSwapReturnDelta);
         assertFalse(p.afterSwapReturnDelta);
-        assertEq(uint160(address(hook)) & 0x3FFF, 0x28C0);
+        assertEq(uint160(address(hook)) & 0x3FFF, 0x20C0);
         assertEq(hook.MAX_ROUNDING_LOSS(), 8);
         assertEq(hook.MAX_SPOT_DEVIATION_BPS(), 500);
         assertEq(hook.MIN_BUFFER(), 16);

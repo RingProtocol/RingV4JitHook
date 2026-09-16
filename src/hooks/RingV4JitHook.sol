@@ -125,7 +125,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory p) {
         p.beforeInitialize = true;
-        p.beforeAddLiquidity = true;
         p.beforeSwap = true;
         p.afterSwap = true;
     }
@@ -280,15 +279,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         poolIds.push(poolId);
         emit PoolCreated(poolId);
         return IHooks.beforeInitialize.selector;
-    }
-
-    function _beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        internal
-        view
-        override
-        returns (bytes4)
-    {
-        return IHooks.beforeAddLiquidity.selector;
     }
 
     /// @notice Hook entry point before the shell swap.

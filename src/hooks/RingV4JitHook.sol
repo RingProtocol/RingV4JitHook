@@ -177,59 +177,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         return _spotDeviationBps(start, forward, lp);
     }
 
-    function quote(PoolKey calldata key, bool zeroForOne, int256 amountSpecified)
-        external
-        view
-        idle
-        returns (uint256 ringIn, uint256 ringOut, RingLPPlanner.Plan memory p)
-    {
-        return _quote(key, zeroForOne, amountSpecified);
-    }
-
-    function getIndicativeQuote(PoolKey calldata key, bool zeroForOne, int256 amountSpecified, bytes calldata)
-        external
-        view
-        returns (uint256)
-    {
-        try this.quote(key, zeroForOne, amountSpecified) returns (uint256, uint256, RingLPPlanner.Plan memory p) {
-            return amountSpecified < 0 ? p.amountOut : p.amountIn;
-        } catch {
-            return 0;
-        }
-    }
-
-    /// @notice Computes the quoted input/output and the JIT plan for a requested swap.
-    /// @dev
-    ///  Example: `zeroForOne = true`, `amountSpecified = -1_000e6` (exact 1,000 USDC out).
-    ///   - The function checks the shell pool is live and has rounding buffers.
-    ///   - It fetches the current slot0 and permanent liquidity.
-    ///   - It searches `_findHybridPlan` for the smallest JIT liquidity that makes the shell
-    ///     pool's required ETH input equal to the FewV4 backend's ETH input for 1,000 USDC.
-    ///   - If no JIT is needed, it validates the shell/inner price deviation is within the
-    ///     allowed 500 bps band (plus fees).
-    function _quote(PoolKey calldata key, bool forward, int256 specified)
-        private
-        view
-        returns (uint256 ringIn, uint256 ringOut, RingLPPlanner.Plan memory p)
-    {
-        _requirePool(key);
-        PoolId poolId = key.toId();
-        _requireBuffers(key);
-        if (specified == 0 || specified == type(int256).min) revert UnexpectedFill();
-        uint256 requested = SafeCast.toUint256(specified < 0 ? -specified : specified);
-        if (requested > type(uint96).max) revert UnexpectedFill();
-        _requireZeroFees(poolId);
-        LpPool memory lp = _route(poolId);
-        uint128 baseLiquidity = poolManager.getLiquidity(poolId);
-        if (baseLiquidity == 0) revert UnexpectedLiquidity();
-        (uint160 start,,,) = poolManager.getSlot0(poolId);
-        (ringIn, ringOut, p) = _findHybridPlan(start, baseLiquidity, specified, forward, key.tickSpacing, lp);
-        if (p.liquidity == 0) {
-            (uint256 deviationBps, uint256 allowedBps) = _spotDeviationBps(start, forward, lp);
-            if (deviationBps > allowedBps) revert QuoteDeviationExceeded();
-        }
-    }
-
     /// @notice Hook entry point before pool initialization. Validates and registers the pool.
     /// @dev
     ///  Validates that the pool key meets the hook's requirements (hooks == this, fee == 0,
@@ -358,6 +305,59 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         jitLockFor(poolId).clear();
         emit RingJitSwap(poolId, params.zeroForOne, p.amountIn, p.amountOut, loss0, loss1);
         return (IHooks.afterSwap.selector, 0);
+    }
+
+    function quote(PoolKey calldata key, bool zeroForOne, int256 amountSpecified)
+        external
+        view
+        idle
+        returns (uint256 ringIn, uint256 ringOut, RingLPPlanner.Plan memory p)
+    {
+        return _quote(key, zeroForOne, amountSpecified);
+    }
+
+    function getIndicativeQuote(PoolKey calldata key, bool zeroForOne, int256 amountSpecified, bytes calldata)
+        external
+        view
+        returns (uint256)
+    {
+        try this.quote(key, zeroForOne, amountSpecified) returns (uint256, uint256, RingLPPlanner.Plan memory p) {
+            return amountSpecified < 0 ? p.amountOut : p.amountIn;
+        } catch {
+            return 0;
+        }
+    }
+
+    /// @notice Computes the quoted input/output and the JIT plan for a requested swap.
+    /// @dev
+    ///  Example: `zeroForOne = true`, `amountSpecified = -1_000e6` (exact 1,000 USDC out).
+    ///   - The function checks the shell pool is live and has rounding buffers.
+    ///   - It fetches the current slot0 and permanent liquidity.
+    ///   - It searches `_findHybridPlan` for the smallest JIT liquidity that makes the shell
+    ///     pool's required ETH input equal to the FewV4 backend's ETH input for 1,000 USDC.
+    ///   - If no JIT is needed, it validates the shell/inner price deviation is within the
+    ///     allowed 500 bps band (plus fees).
+    function _quote(PoolKey calldata key, bool forward, int256 specified)
+        private
+        view
+        returns (uint256 ringIn, uint256 ringOut, RingLPPlanner.Plan memory p)
+    {
+        _requirePool(key);
+        PoolId poolId = key.toId();
+        _requireBuffers(key);
+        if (specified == 0 || specified == type(int256).min) revert UnexpectedFill();
+        uint256 requested = SafeCast.toUint256(specified < 0 ? -specified : specified);
+        if (requested > type(uint96).max) revert UnexpectedFill();
+        _requireZeroFees(poolId);
+        LpPool memory lp = _route(poolId);
+        uint128 baseLiquidity = poolManager.getLiquidity(poolId);
+        if (baseLiquidity == 0) revert UnexpectedLiquidity();
+        (uint160 start,,,) = poolManager.getSlot0(poolId);
+        (ringIn, ringOut, p) = _findHybridPlan(start, baseLiquidity, specified, forward, key.tickSpacing, lp);
+        if (p.liquidity == 0) {
+            (uint256 deviationBps, uint256 allowedBps) = _spotDeviationBps(start, forward, lp);
+            if (deviationBps > allowedBps) revert QuoteDeviationExceeded();
+        }
     }
 
     /// @notice Donates any hook credits up to the active limit, then resolves the remaining

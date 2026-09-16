@@ -32,16 +32,16 @@ import {jitLockFor, requireJITNotInProgress} from "../alf/types/JITLock.sol";
 /// @notice JIT-backed Uniswap v4 hook that sources real FewToken v4 liquidity for each swap.
 /// @dev
 ///  Example lifecycle for a user selling 0.5 ETH (currency0) to buy 1,000 USDC (currency1):
-///   1. Anyone initializes an outer pool with ETH/USDC as currency0/currency1 via `poolManager.initialize`.
+///   1. Anyone initializes an shell pool with ETH/USDC as currency0/currency1 via `poolManager.initialize`.
 ///      The hook's `_beforeInitialize` validates and records the pool.
 ///   2. Owner sets a backend FewToken v4 pool with fwETH/fwUSDC whose raw tokens are ETH/USDC.
-///   3. Owner adds liquidity to the outer pool and calls `setPoolLive(key, true)`.
-///   4. A user calls `poolManager.swap` on the outer pool with `amountSpecified = -1_000e6`
+///   3. Owner adds liquidity to the shell pool and calls `setPoolLive(key, true)`.
+///   4. A user calls `poolManager.swap` on the shell pool with `amountSpecified = -1_000e6`
 ///      (exact output of 1,000 USDC) and `zeroForOne = true`.
 ///   5. `_beforeSwap` is invoked: it quotes the backend, finds the JIT liquidity that makes
-///      the outer-pool cost match the backend quote, adds that JIT position, and prefunds the
+///      the shell-pool cost match the backend quote, adds that JIT position, and prefunds the
 ///      1,000 USDC by wrapping ETH, swapping on the backend, and unwrapping the USDC.
-///   6. The outer v4 swap executes through the JIT + permanent liquidity, consuming ~0.5 ETH
+///   6. The shell v4 swap executes through the JIT + permanent liquidity, consuming ~0.5 ETH
 ///      and producing ~1,000 USDC in PoolManager deltas.
 ///   7. `_afterSwap` removes the JIT position, validates the deltas, and resolves any small
 ///      rounding remainder using `roundingReserve` (capped at MAX_ROUNDING_LOSS per currency).
@@ -61,16 +61,12 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     RingV4JitQuoter private immutable _quoter;
     address public immutable factory;
 
-    /// @notice Array of all registered outer-pool IDs.
+    /// @notice Array of all registered shell-pool IDs.
     PoolId[] public poolIds;
-    /// @notice Maps a registered outer-pool ID to its PoolKey.
+    /// @notice Maps a registered shell-pool ID to its PoolKey.
     mapping(PoolId => PoolKey) public poolKeys;
-    /// @notice Whether an outer pool ID has been registered by `_beforeInitialize`.
-    mapping(PoolId => bool) public poolRegistered;
     /// @notice Per-pool live flag; swaps are only accepted when `poolLive[poolId]` is true.
     mapping(PoolId => bool) public poolLive;
-    /// @notice Tracks currencies that belong to at least one registered pool (for rounding admin).
-    mapping(Currency => bool) private _currencyRegistered;
 
     /// @notice Per-pool backend FewToken v4 pool configuration.
     mapping(PoolId => LpPool) public lpPools;
@@ -172,7 +168,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     }
 
     function fundRounding(Currency currency, uint256 amount) external onlyOwner idle nonReentrant {
-        _requireCurrency(currency);
         uint256 beforeBalance = currency.balanceOfSelf();
         IERC20(Currency.unwrap(currency)).safeTransferFrom(msg.sender, address(this), amount);
         if (currency.balanceOfSelf() != beforeBalance + amount) revert UnexpectedTokenDelta();
@@ -181,7 +176,6 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     }
 
     function withdrawRounding(Currency currency, uint256 amount, address to) external onlyOwner idle nonReentrant {
-        _requireCurrency(currency);
         if (to == address(0)) revert InvalidRecipient();
         roundingReserve[currency] -= amount;
         currency.transfer(to, amount);
@@ -238,11 +232,11 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     /// @notice Computes the quoted input/output and the JIT plan for a requested swap.
     /// @dev
     ///  Example: `zeroForOne = true`, `amountSpecified = -1_000e6` (exact 1,000 USDC out).
-    ///   - The function checks the outer pool is live and has rounding buffers.
+    ///   - The function checks the shell pool is live and has rounding buffers.
     ///   - It fetches the current slot0 and permanent liquidity.
-    ///   - It searches `_findHybridPlan` for the smallest JIT liquidity that makes the outer
+    ///   - It searches `_findHybridPlan` for the smallest JIT liquidity that makes the shell
     ///     pool's required ETH input equal to the FewV4 backend's ETH input for 1,000 USDC.
-    ///   - If no JIT is needed, it validates the outer/inner price deviation is within the
+    ///   - If no JIT is needed, it validates the shell/inner price deviation is within the
     ///     allowed 500 bps band (plus fees).
     function _quote(PoolKey calldata key, bool forward, int256 specified)
         private
@@ -272,8 +266,9 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     /// @dev
     ///  Validates that the pool key meets the hook's requirements (hooks == this, fee == 0,
     ///  valid tick spacing, non-native sorted ERC20 currencies). On success, records the
-    ///  poolId in `poolIds`, stores the key in `poolKeys`, marks `poolRegistered`, and
-    ///  registers both currencies. Reverts `InvalidPool` on validation failure or duplicate.
+    ///  poolId in `poolIds`, stores the key in `poolKeys`, and registers both
+    ///  currencies. Reverts `InvalidPool` on validation failure. Duplicate
+    ///  initialization is prevented by the PoolManager itself.
     function _beforeInitialize(address, PoolKey calldata key, uint160) internal override returns (bytes4) {
         if (
             address(key.hooks) != address(this) || key.fee != 0 || key.tickSpacing <= 0 || key.tickSpacing > 200
@@ -281,12 +276,8 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
                 || Currency.unwrap(key.currency0).code.length == 0 || Currency.unwrap(key.currency1).code.length == 0
         ) revert InvalidPool();
         PoolId poolId = key.toId();
-        if (poolRegistered[poolId]) revert InvalidPool();
-        poolRegistered[poolId] = true;
         poolKeys[poolId] = key;
         poolIds.push(poolId);
-        _currencyRegistered[key.currency0] = true;
-        _currencyRegistered[key.currency1] = true;
         emit PoolCreated(poolId);
         return IHooks.beforeInitialize.selector;
     }
@@ -300,15 +291,15 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         return IHooks.beforeAddLiquidity.selector;
     }
 
-    /// @notice Hook entry point before the outer swap.
+    /// @notice Hook entry point before the shell swap.
     /// @dev
     ///  Example: user swaps exact 1,000 USDC out, `zeroForOne = true`.
-    ///   - Enters the JIT lock and rejects non-zero outer-pool fees.
+    ///   - Enters the JIT lock and rejects non-zero shell-pool fees.
     ///   - If `hookData == SYNC_SWAP`, this is a price-sync trade against permanent liquidity.
     ///   - Otherwise `_quote` is called to get the plan (ringIn/ringOut/JIT liquidity).
     ///   - The user's `sqrtPriceLimitX96` is checked against the planned end price.
     ///   - If a JIT plan exists, `_execute` prefunds the output and `modifyLiquidity` adds
-    ///     the JIT position so the outer swap can clear at the quoted price.
+    ///     the JIT position so the shell swap can clear at the quoted price.
     function _beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata hookData)
         internal
         override
@@ -345,16 +336,16 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    /// @notice Hook exit point after the outer swap has executed.
+    /// @notice Hook exit point after the shell swap has executed.
     /// @dev
     ///  Example: user received 1,000 USDC and paid 0.5 ETH.
     ///   - For a SYNC_SWAP it only verifies direction and emits `PriceSyncSwap`.
     ///   - For a normal swap it verifies `delta` matches `_active` (input = -p.amountIn,
     ///     output = p.amountOut, end price = p.end).
-    ///   - It enforces a post-swap price limit: the outer pool's end price must stay within
+    ///   - It enforces a post-swap price limit: the shell pool's end price must stay within
     ///     `MAX_SPOT_DEVIATION_BPS` (plus the backend fee buffer) of the backend FewToken
     ///     pool price, reverting `PriceLimitExceeded` otherwise. This blocks flash-loan
-    ///     manipulation that would push the outer price away from the backed reference.
+    ///     manipulation that would push the shell price away from the backed reference.
     ///   - It removes the JIT position if one was added.
     ///   - It donates small positive deltas to the pool (rewards) and resolves the remaining
     ///     rounding with `roundingReserve`.
@@ -388,7 +379,7 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         }
         (uint160 end,,,) = poolManager.getSlot0(poolId);
         if (end != p.end) revert UnexpectedFill();
-        // Post-swap price limit: keep the outer pool price aligned with the backend
+        // Post-swap price limit: keep the shell pool price aligned with the backend
         // FewToken pool so a flash-loan cannot push it away from the backed reference.
         LpPool memory lp = _route(poolId);
         (uint256 deviationBps, uint256 allowedBps) = _spotDeviationBps(end, params.zeroForOne, lp);
@@ -430,12 +421,12 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         _resolve(key.currency1);
     }
 
-    /// @notice Searches for a JIT liquidity amount such that the outer-pool swap cost matches
+    /// @notice Searches for a JIT liquidity amount such that the shell-pool swap cost matches
     /// the FewV4 backend swap cost.
     /// @dev
     ///  Example: baseLiquidity = 10_000, requested USDC out = 1_000, `forward = true`.
     ///   - It tries candidate JIT liquidities (base, 2x, 4x, ... up to 32 doublings) and runs
-    ///     the backend quote to compare `ringIn` (backend ETH in) vs `jitIn` (outer ETH in).
+    ///     the backend quote to compare `ringIn` (backend ETH in) vs `jitIn` (shell ETH in).
     ///   - The difference `diff = ringIn - jitIn` tells us whether the backend is cheaper.
     ///   - It keeps the candidate with |diff| closest to zero, then narrows with binary search.
     ///   - If a "surplus" candidate (`diff <= 0`) fits within one backend-input quantum, it is
@@ -545,9 +536,9 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
         }
     }
 
-    /// @notice Compares the outer pool price to the backend FewToken pool price.
+    /// @notice Compares the shell pool price to the backend FewToken pool price.
     /// @dev
-    ///  Example: if the outer price is 5% higher than the backend, the returned deviation
+    ///  Example: if the shell price is 5% higher than the backend, the returned deviation
     ///   is roughly 500 bps; it must not exceed `allowedBps` (500 bps + fee buffer).
     function _spotDeviationBps(uint160 start, bool forward, LpPool memory lp)
         private
@@ -604,11 +595,7 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     }
 
     function _requirePool(PoolKey calldata key) private view {
-        if (!poolRegistered[key.toId()]) revert InvalidPool();
-    }
-
-    function _requireCurrency(Currency currency) private view {
-        if (!_currencyRegistered[currency]) revert InvalidPool();
+        if (poolKeys[key.toId()].currency0.isAddressZero()) revert InvalidPool();
     }
 
     function _requireBuffers(PoolKey calldata key) private view {
@@ -662,7 +649,7 @@ contract RingV4JitHook is BaseHook, DeltaResolver, Ownable2Step, ReentrancyGuard
     ///   3. Swap on the backend (exact output) to receive `ringOut` fwUSDC.
     ///   4. Unwrap fwUSDC into raw USDC and settle it to PoolManager.
     ///   5. After this, the hook's PoolManager deltas are `-ringIn` input and `+ringOut`
-    ///      output, matching the user-facing outer swap.
+    ///      output, matching the user-facing shell swap.
     function _execute(PoolKey calldata key, bool forward, uint256 ringIn, uint256 ringOut) private {
         PoolId poolId = key.toId();
         LpPool memory lp = _route(poolId);

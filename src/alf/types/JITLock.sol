@@ -27,8 +27,8 @@ error JITInProgress();
 ///
 ///         1. **Per-pool lock** (this type's wrapped slot): set by {enter}, cleared by {clear}.
 ///            {enter} rejects same-pool reentry, which would otherwise corrupt the lifecycle: an
-///            inner cycle's {clear} would zero the slot while the outer cycle is still mid-flight,
-///            orphaning the outer's deployed positions.
+///            inner cycle's {clear} would zero the slot while the shell cycle is still mid-flight,
+///            orphaning the shell's deployed positions.
 ///         2. **Global in-flight counter** ({JIT_GLOBAL_COUNTER_SLOT}): a single process-wide slot
 ///            incremented and decremented alongside the per-pool lock. {requireJITNotInProgress}
 ///            reads it to reject cross-pool reentry, e.g. a vault callback during pool A's cycle

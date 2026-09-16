@@ -42,7 +42,7 @@ contract RingV4JitHookForkTest is Test {
     RingLPRouter router;
     PoolModifyLiquidityTest lp;
 
-    PoolKey key; // outer pool: WBTC/WETH with hook, fee=0, ts=60
+    PoolKey key; // shell pool: WBTC/WETH with hook, fee=0, ts=60
     PoolKey lpKey; // backend pool: FEW_WBTC/FEW_WETH hookless, fee=3000, ts=60
 
     uint160 backendSqrtPrice;
@@ -96,7 +96,7 @@ contract RingV4JitHookForkTest is Test {
         hook = new RingV4JitHook{salt: salt}(pm, few, address(this));
 
         // ------------------------------------------------------------------
-        // 5. Initialize outer pool (WBTC/WETH, fee=0, ts=60, hook)
+        // 5. Initialize shell pool (WBTC/WETH, fee=0, ts=60, hook)
         // ------------------------------------------------------------------
         key = PoolKey(Currency.wrap(WBTC), Currency.wrap(WETH), 0, 60, IHooks(address(hook)));
         pm.initialize(key, backendSqrtPrice);
@@ -117,7 +117,7 @@ contract RingV4JitHookForkTest is Test {
         hook.fundRounding(key.currency1, 1_000_000); // 0.000001 WETH
 
         // ------------------------------------------------------------------
-        // 8. Add full-range base liquidity to outer pool
+        // 8. Add full-range base liquidity to shell pool
         // ------------------------------------------------------------------
         IERC20(WBTC).approve(address(lp), type(uint256).max);
         IERC20(WETH).approve(address(lp), type(uint256).max);
@@ -128,7 +128,7 @@ contract RingV4JitHookForkTest is Test {
             ),
             ""
         );
-        assertGt(pm.getLiquidity(key.toId()), 0, "outer pool has no base liquidity");
+        assertGt(pm.getLiquidity(key.toId()), 0, "shell pool has no base liquidity");
 
         // ------------------------------------------------------------------
         // 9. Set pool live
@@ -270,7 +270,7 @@ contract RingV4JitHookForkTest is Test {
         }
     }
 
-    /// @notice Test syncPrice moves the outer pool price without touching the backend.
+    /// @notice Test syncPrice moves the shell pool price without touching the backend.
     function test_ForkSyncPrice() public {
         (uint160 start,,,) = pm.getSlot0(key.toId());
         // Sync to a slightly different price (move tick by a few ticks)
@@ -284,18 +284,18 @@ contract RingV4JitHookForkTest is Test {
             router.syncPrice(key, SwapParams(false, -int256(amount), target), 1, block.timestamp);
             assertEq(_backendStateHash(), backendBefore, "backend should not change");
             (uint160 end,,,) = pm.getSlot0(key.toId());
-            assertEq(end, target, "outer price should reach target");
+            assertEq(end, target, "shell price should reach target");
             _assertSettled();
         }
     }
 
-    /// @notice Test that deviation guard blocks quotes when outer price diverges from backend.
+    /// @notice Test that deviation guard blocks quotes when shell price diverges from backend.
     function test_ForkDeviationGuard() public {
-        // At setup, outer price == backend price, so quote should work
+        // At setup, shell price == backend price, so quote should work
         (,, RingLPPlanner.Plan memory p) = hook.quote(key, true, -int256(0.01e8));
         assertGt(p.amountOut, 0, "quote should work when prices are aligned");
 
-        // Move the outer price very far from the backend (4x) to force JIT failure
+        // Move the shell price very far from the backend (4x) to force JIT failure
         // and trigger the deviation guard on the base-only fallback path
         (uint160 start,,,) = pm.getSlot0(key.toId());
         uint160 target = uint160(uint256(start) * 4);

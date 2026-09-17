@@ -116,6 +116,7 @@ contract RingV4JitHookTest is Test {
     address fwA;
     address fwB;
     uint256[4] donated;
+    uint128 expectedBase;
 
     function _defensiveWrappers() internal returns (DefensiveFewWrappedToken input, DefensiveFewWrappedToken output) {
         _fullRange(lpKey, -int256(uint256(BACKEND_LIQUIDITY)));
@@ -172,7 +173,7 @@ contract RingV4JitHookTest is Test {
         pm.initialize(lpKey, Q96);
         _fullRange(lpKey, int256(uint256(BACKEND_LIQUIDITY)));
         bytes memory args = abi.encode(pm, few, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 10_000_000);
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x28c0, 10_000_000);
         hook = new RingV4JitHook{salt: salt}(pm, few, address(this));
         key = PoolKey(Currency.wrap(a), Currency.wrap(b), 0, 60, IHooks(address(hook)));
         pm.initialize(key, Q96);
@@ -182,6 +183,7 @@ contract RingV4JitHookTest is Test {
         hook.fundRounding(key.currency0, 1_000_000);
         hook.fundRounding(key.currency1, 1_000_000);
         _fullRange(key, int256(uint256(BASE_LIQUIDITY)));
+        expectedBase = BASE_LIQUIDITY;
     }
 
     function _approve(address token) internal {
@@ -250,11 +252,11 @@ contract RingV4JitHookTest is Test {
         assertEq(IERC20(b).balanceOf(address(hook)), hook.roundingReserve(key.currency1) + donated[1]);
         assertEq(IERC20(a).allowance(address(hook), fwA), 0);
         assertEq(IERC20(b).allowance(address(hook), fwB), 0);
-        assertEq(pm.getLiquidity(key.toId()), BASE_LIQUIDITY);
+        assertEq(pm.getLiquidity(key.toId()), expectedBase);
         (uint128 base,,) = pm.getPositionInfo(
             key.toId(), address(lp), TickMath.minUsableTick(key.tickSpacing), TickMath.maxUsableTick(key.tickSpacing), 0
         );
-        assertEq(base, BASE_LIQUIDITY);
+        assertEq(base, expectedBase);
     }
 
     function _assertSwapEvents(RingLPPlanner.Plan memory p) internal view {
@@ -316,24 +318,44 @@ contract RingV4JitHookTest is Test {
         assertEq(ringIn == 0, ringOut == 0);
         assertEq(p.liquidity == 0, ringIn == 0);
         assertEq(exactInput ? p.amountIn : p.amountOut, size);
+        _assertPlanMatchesQuote(exactInput, p, ringIn, ringOut);
         TradeSnapshot memory s = _tradeSnapshot(forward);
         vm.recordLogs();
         BalanceDelta delta =
             router.swap(key, _params(forward, specified), exactInput ? p.amountOut : p.amountIn, block.timestamp);
         _assertSwapEvents(p);
-        assertEq(int256(forward ? delta.amount0() : delta.amount1()), -int256(p.amountIn));
-        assertEq(int256(forward ? delta.amount1() : delta.amount0()), int256(p.amountOut));
-        assertEq(s.userIn - IERC20(forward ? a : b).balanceOf(address(this)), p.amountIn);
-        assertEq(IERC20(forward ? b : a).balanceOf(address(this)) - s.userOut, p.amountOut);
-        assertEq(IERC20(forward ? fwA : fwB).balanceOf(address(pm)) - s.backendIn, ringIn);
-        assertEq(s.backendOut - IERC20(forward ? fwB : fwA).balanceOf(address(pm)), ringOut);
-        assertLe(s.reserve0 - hook.roundingReserve(key.currency0), 8);
-        assertLe(s.reserve1 - hook.roundingReserve(key.currency1), 8);
+        _assertTradeDeltas(forward, p, s, delta);
         (uint160 end,,,) = pm.getSlot0(key.toId());
         assertEq(end, p.end);
         if (p.liquidity == 0) assertEq(_poolState(lpKey), s.backendState);
         else assertNotEq(_poolState(lpKey), s.backendState);
         _assertSettled();
+    }
+
+    /// @dev A JIT plan must deliver the backend quote on the hook-safe side within rounding:
+    ///      exact input pays out <= ringOut, exact output costs >= ringIn.
+    function _assertPlanMatchesQuote(bool exactInput, RingLPPlanner.Plan memory p, uint256 ringIn, uint256 ringOut)
+        internal
+        pure
+    {
+        if (p.liquidity == 0) return;
+        if (exactInput) assertApproxEqAbs(p.amountOut, ringOut, 8);
+        else assertApproxEqAbs(p.amountIn, ringIn, 8);
+        assertLe(p.jitCost, p.jitIn + 8);
+    }
+
+    function _assertTradeDeltas(bool forward, RingLPPlanner.Plan memory p, TradeSnapshot memory s, BalanceDelta delta)
+        internal
+        view
+    {
+        assertEq(int256(forward ? delta.amount0() : delta.amount1()), -int256(p.amountIn));
+        assertEq(int256(forward ? delta.amount1() : delta.amount0()), int256(p.amountOut));
+        assertEq(s.userIn - IERC20(forward ? a : b).balanceOf(address(this)), p.amountIn);
+        assertEq(IERC20(forward ? b : a).balanceOf(address(this)) - s.userOut, p.amountOut);
+        assertEq(IERC20(forward ? fwA : fwB).balanceOf(address(pm)) - s.backendIn, p.jitCost);
+        assertEq(s.backendOut - IERC20(forward ? fwB : fwA).balanceOf(address(pm)), p.jitOut);
+        assertLe(int256(s.reserve0) - int256(hook.roundingReserve(key.currency0)), 8);
+        assertLe(int256(s.reserve1) - int256(hook.roundingReserve(key.currency1)), 8);
     }
 
     function _expectHookError(bytes4 reason) internal {
@@ -473,8 +495,8 @@ contract RingV4JitHookTest is Test {
         _trade(false, true, 1 ether);
         _trade(true, false, 1 ether);
         _trade(false, false, 1 ether);
-        assertLe(reserve0 - hook.roundingReserve(key.currency0), 32);
-        assertLe(reserve1 - hook.roundingReserve(key.currency1), 32);
+        assertLe(int256(reserve0) - int256(hook.roundingReserve(key.currency0)), 32);
+        assertLe(int256(reserve1) - int256(hook.roundingReserve(key.currency1)), 32);
         for (uint256 i; i < tokens.length; ++i) {
             assertEq(IERC20(tokens[i]).balanceOf(donor), 123);
         }
@@ -535,10 +557,10 @@ contract RingV4JitHookTest is Test {
 
     function test_PermissionsAndConstants() public view {
         Hooks.Permissions memory p = hook.getHookPermissions();
-        assertTrue(p.beforeInitialize && p.beforeSwap && p.afterSwap);
-        assertFalse(p.beforeAddLiquidity || p.beforeRemoveLiquidity);
+        assertTrue(p.beforeInitialize && p.beforeAddLiquidity && p.beforeSwap && p.afterSwap);
+        assertFalse(p.beforeRemoveLiquidity);
         assertFalse(p.beforeSwapReturnDelta || p.afterSwapReturnDelta);
-        assertEq(uint160(address(hook)) & 0x3fff, 0x20c0);
+        assertEq(uint160(address(hook)) & 0x3fff, 0x28c0);
         assertEq(hook.MAX_ROUNDING_LOSS(), 8);
         assertEq(hook.MAX_SPOT_DEVIATION_BPS(), 500);
     }
@@ -613,10 +635,10 @@ contract RingV4JitHookTest is Test {
         assertEq(PoolId.unwrap(hook.getLpPool(key).lpPoolKey.toId()), PoolId.unwrap(lpKey.toId()));
     }
 
-    function test_InitializeRejectsNativeAndDuplicatePool() public {
+    function test_InitializeRejectsNativeNonzeroFeeAndDuplicatePool() public {
         MockFewFactory otherFew = new MockFewFactory();
         bytes memory args = abi.encode(pm, otherFew, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 10_000_000);
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x28c0, 10_000_000);
         RingV4JitHook other = new RingV4JitHook{salt: salt}(pm, otherFew, address(this));
         PoolKey memory candidate = key;
         candidate.hooks = IHooks(address(other));
@@ -624,6 +646,10 @@ contract RingV4JitHookTest is Test {
         vm.expectRevert();
         pm.initialize(candidate, Q96);
         candidate.currency0 = key.currency0;
+        candidate.fee = 3000;
+        vm.expectRevert();
+        pm.initialize(candidate, Q96);
+        candidate.fee = 0;
         pm.initialize(candidate, Q96);
         assertFalse(other.getLpPool(candidate).set);
         vm.expectRevert();
@@ -805,12 +831,44 @@ contract RingV4JitHookTest is Test {
         _trade(true, true, 1 ether);
     }
 
-    function test_BufferGuards() public {
+    function test_ReserveFundingAndProtocolFeeGuards() public {
         hook.withdrawRounding(key.currency0, 999_990, address(this));
         assertEq(hook.getIndicativeQuote(key, true, -int256(1 ether), ""), 0);
         vm.expectRevert();
         router.swap(key, _params(true, -int256(1 ether)), 1, block.timestamp);
         hook.fundRounding(key.currency0, 999_990);
+        manager.setProtocolFeeController(address(this));
+        manager.setProtocolFee(key, 1000);
+        assertEq(hook.getIndicativeQuote(key, true, -int256(1 ether), ""), 0);
+        vm.expectRevert();
+        router.swap(key, _params(true, -int256(1 ether)), 1, block.timestamp);
+    }
+
+    function test_NonFullRangeLiquidityRejected() public {
+        vm.expectRevert();
+        _range(key, -60, 60, 1 ether);
+    }
+
+    /// @notice A shell pool with negligible permanent liquidity still fills large orders at
+    /// the backend quote, in every mode.
+    function test_TinyBaseLiquidityExactFillAllModes() public {
+        _fullRange(key, -int256(uint256(BASE_LIQUIDITY)));
+        _fullRange(key, 1e14);
+        expectedBase = 1e14;
+        (uint256 ringIn, uint256 ringOut, RingLPPlanner.Plan memory p) = hook.quote(key, true, -int256(1 ether));
+        assertGt(p.liquidity, 0);
+        assertGt(ringIn, 0);
+        assertGt(ringOut, 0);
+        // The user-facing fill matches the backend quote within the rounding cap.
+        assertLe(p.amountOut, ringOut);
+        assertApproxEqAbs(p.amountOut, ringOut, 8);
+        // The backend leg buys exactly the JIT share, never more than the position collected.
+        assertLe(p.jitCost, p.jitIn + 8);
+        assertEq(p.jitOut <= p.amountOut, true);
+        _trade(true, true, 1 ether);
+        _trade(false, true, 1 ether);
+        _trade(true, false, 1 ether);
+        _trade(false, false, 1 ether);
     }
 
     function test_BackendTickCrossingWithFeesUsesJIT() public {

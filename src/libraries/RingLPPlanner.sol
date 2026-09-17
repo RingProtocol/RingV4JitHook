@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
@@ -14,7 +13,6 @@ import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 library RingLPPlanner {
     uint256 internal constant MIN_AMOUNT = 10_000;
     uint256 internal constant MAX_AMOUNT = type(uint96).max;
-    uint256 internal constant MAX_PRICE_ROUNDING = 2;
     error UnrepresentableOrder();
 
     struct Plan {
@@ -25,69 +23,94 @@ library RingLPPlanner {
         int24 upper;
         uint256 amountIn;
         uint256 amountOut;
+        // Net token amounts the JIT position contributes: input collected and output given.
+        uint256 jitIn;
+        uint256 jitOut;
+        // Backend leg expectations, set by the caller: the exact-input cost of `jitOut` on
+        // the backend pool and the backend sqrt price after that leg executes.
+        uint256 jitCost;
+        uint160 backendEnd;
     }
 
-    function plan(uint256 ringIn, uint256 ringOut, bool zeroForOne, bool exactInput, int24 spacing)
-        internal
-        pure
-        returns (Plan memory p)
-    {
+    /// @notice Closed-form JIT plan matching an external quote of `ringIn` in / `ringOut` out
+    ///         for the user's `specified` amount.
+    /// @dev
+    ///  For constant liquidity traversed from `start` to `end`, the fill ratio satisfies
+    ///  `amountOut / amountIn == start * end / Q96^2` (zeroForOne; mirrored for oneForZero),
+    ///  so the end price is solved directly:
+    ///      zeroForOne: end = ringOut * Q96^2 / (ringIn * start)
+    ///      oneForZero: end = ringIn  * Q96^2 / (ringOut * start)
+    ///  and the total liquidity follows from the fill equation of the unspecified side:
+    ///      token1 side: amount1 = L * |end - start| / Q96
+    ///      token0 side: amount0 = L * Q96 * |end - start| / (start * end)
+    ///  The solved liquidity is verified with an exact `simulate` and nudged so the fill
+    ///  lands within `tolerance` of the quote on the hook-safe side: an exact-input fill
+    ///  must produce `amountOut <= ringOut` and an exact-output fill must cost
+    ///  `amountIn >= ringIn` (the hook can always afford the convexity discount on its
+    ///  proportional share, but never a deficit).
+    ///  Returns `liquidity == 0` when the quote cannot be expressed from `start` — spot on
+    ///  the wrong side of the quote's average price, dust, or permanent liquidity already
+    ///  sufficient — in which case the caller falls back to permanent liquidity.
+    function planQuoted(
+        uint160 start,
+        uint128 baseLiquidity,
+        uint256 ringIn,
+        uint256 ringOut,
+        int256 specified,
+        bool zeroForOne,
+        int24 spacing,
+        uint256 tolerance
+    ) internal pure returns (Plan memory p) {
         if (
-            ringIn < MIN_AMOUNT || ringOut < MIN_AMOUNT || ringIn > MAX_AMOUNT || ringOut > MAX_AMOUNT || spacing <= 0
-                || spacing > 200
-        ) {
-            revert UnrepresentableOrder();
-        }
-        p.liquidity = SafeCast.toUint128(Math.sqrt(ringIn * ringOut) * 1000);
-        // Q128 ratio remains below 2^224 for the supported uint96 amounts.
-        uint256 ratio = FullMath.mulDiv(zeroForOne ? ringOut : ringIn, 1 << 128, zeroForOne ? ringIn : ringOut);
-        uint160 midPrice = SafeCast.toUint160(Math.sqrt(ratio) << 32);
-        uint160 lo = midPrice / 2;
-        uint160 hi = midPrice * 2;
-        if (lo <= TickMath.MIN_SQRT_PRICE || hi >= TickMath.MAX_SQRT_PRICE) revert UnrepresentableOrder();
-        int256 specified = exactInput ? -SafeCast.toInt256(ringIn) : SafeCast.toInt256(ringOut);
+            specified == 0 || ringIn < MIN_AMOUNT || ringOut < MIN_AMOUNT || ringIn > MAX_AMOUNT || ringOut > MAX_AMOUNT
+                || spacing <= 0 || spacing > 200
+        ) return p;
+        bool exactInput = specified < 0;
+        uint256 q = (uint256(1) << 192) / start; // Q96^2 / start, <1 wei of relative error
+        uint256 end = zeroForOne ? FullMath.mulDiv(ringOut, q, ringIn) : FullMath.mulDiv(ringIn, q, ringOut);
+        // The fill's average price cannot beat `start`: zeroForOne needs end < start.
+        if (zeroForOne ? end >= start : end <= start) return p;
+        if (end <= TickMath.MIN_SQRT_PRICE || end >= TickMath.MAX_SQRT_PRICE) return p;
+        uint256 gap = zeroForOne ? start - uint160(end) : uint160(end) - start;
+        // Solve total liquidity from the unspecified side's fill equation.
+        //   exact input  -> solve on the output (quote amount ringOut)
+        //   exact output -> solve on the input  (quote amount ringIn)
         uint256 target = exactInput ? ringOut : ringIn;
-        bool increasing = zeroForOne == exactInput;
-        // Locate the transition around the Ring amount, then select a user-favourable candidate.
-        while (lo < hi) {
-            uint160 middle = lo + (hi - lo) / 2;
-            (, uint256 input, uint256 output) = simulate(middle, p.liquidity, specified, zeroForOne, spacing);
-            uint256 metric = exactInput ? output : input;
-            if (increasing ? metric < target : metric > target) lo = middle + 1;
-            else hi = middle;
-        }
-        bool found;
-        for (uint256 i; i < 2; ++i) {
-            uint160 candidate = i == 0 ? lo : lo - 1;
-            (uint160 end, uint256 input, uint256 output) =
-                simulate(candidate, p.liquidity, specified, zeroForOne, spacing);
-            bool acceptable = exactInput
-                ? input == ringIn && output >= ringOut && output - ringOut <= MAX_PRICE_ROUNDING
-                : output == ringOut && input <= ringIn && ringIn - input <= MAX_PRICE_ROUNDING;
-            if (acceptable) {
-                p.start = candidate;
-                p.end = end;
-                p.amountIn = input;
-                p.amountOut = output;
-                found = true;
-                break;
+        uint256 total = zeroForOne == exactInput
+            ? FullMath.mulDiv(target, 1 << 96, gap)
+            : FullMath.mulDiv(FullMath.mulDiv(target, start, 1 << 96), end, gap);
+        // Exact input rounds down so `amountOut <= ringOut`; exact output rounds up so
+        // `amountIn >= ringIn`.
+        if (!exactInput) total += 1;
+        if (total <= baseLiquidity) return p;
+        uint256 jit = total - baseLiquidity;
+        if (jit == 0 || jit > type(uint128).max - baseLiquidity) return p;
+        for (uint256 i; i < 8; ++i) {
+            p = planAtCurrent(start, baseLiquidity, uint128(jit), specified, zeroForOne, spacing);
+            uint256 diff;
+            bool grow;
+            if (exactInput) {
+                if (p.amountOut <= ringOut && ringOut - p.amountOut <= tolerance) return p;
+                grow = p.amountOut < ringOut;
+                diff = p.amountOut > ringOut ? p.amountOut - ringOut : ringOut - p.amountOut;
+            } else {
+                if (p.amountIn >= ringIn && p.amountIn - ringIn <= tolerance) return p;
+                grow = p.amountIn < ringIn;
+                diff = p.amountIn > ringIn ? p.amountIn - ringIn : ringIn - p.amountIn;
+            }
+            uint256 step = zeroForOne == exactInput
+                ? FullMath.mulDiv(diff, 1 << 96, gap)
+                : FullMath.mulDiv(FullMath.mulDiv(diff, start, 1 << 96), end, gap);
+            if (grow) {
+                jit += step + 1;
+                if (jit > type(uint128).max - baseLiquidity) break;
+            } else {
+                if (step + 1 >= jit) break;
+                jit -= step + 1;
             }
         }
-        if (!found) revert UnrepresentableOrder();
-        int24 startTick = TickMath.getTickAtSqrtPrice(p.start);
-        int24 endTick = TickMath.getTickAtSqrtPrice(p.end);
-        // Keep BOTH endpoints strictly inside the position. This also handles a starting
-        // exact tick whose stored tick is tick-1 after the empty-pool reposition swap.
-        p.lower = (_floor(startTick < endTick ? startTick : endTick, spacing) - 1) * spacing;
-        p.upper = (_floor(startTick > endTick ? startTick : endTick, spacing) + 2) * spacing;
-        if (p.lower < TickMath.minUsableTick(spacing) || p.upper > TickMath.maxUsableTick(spacing)) {
-            revert UnrepresentableOrder();
-        }
-    }
-
-    function _floor(int24 tick, int24 spacing) private pure returns (int24 compressed) {
-        compressed = tick / spacing;
-        if (tick < 0 && tick % spacing != 0) --compressed;
+        Plan memory empty;
+        return empty;
     }
 
     /// @notice Builds the JIT leg on top of active full-range base liquidity at the stored pool price.
@@ -98,7 +121,7 @@ library RingLPPlanner {
         int256 specified,
         bool zeroForOne,
         int24 spacing
-    ) internal pure returns (Plan memory p, uint256 jitIn, uint256 jitOut) {
+    ) internal pure returns (Plan memory p) {
         if (jitLiquidity == 0 || baseLiquidity > type(uint128).max - jitLiquidity) {
             revert UnrepresentableOrder();
         }
@@ -120,17 +143,22 @@ library RingLPPlanner {
         uint256 remove1 = SqrtPriceMath.getAmount1Delta(lowerPrice, p.end, jitLiquidity, false);
         if (zeroForOne) {
             if (remove0 <= add0 || add1 <= remove1) revert UnrepresentableOrder();
-            jitIn = remove0 - add0;
-            jitOut = add1 - remove1;
+            p.jitIn = remove0 - add0;
+            p.jitOut = add1 - remove1;
         } else {
             if (remove1 <= add1 || add0 <= remove0) revert UnrepresentableOrder();
-            jitIn = remove1 - add1;
-            jitOut = add0 - remove0;
+            p.jitIn = remove1 - add1;
+            p.jitOut = add0 - remove0;
         }
     }
 
-    /// @dev Constant liquidity, no initialized interior ticks, and a full-range price limit.
+    /// @dev Simulates a v4 swap over constant liquidity with no initialized interior ticks.
+    ///      The shell pool only holds full-range positions, so liquidity is uniform across
+    ///      all ticks and there are no interior tick boundaries to cross. The only
+    ///      boundaries the swap must step over are the 256-tick bitmap word boundaries
+    ///      (where v4 checks whether the next word has initialized ticks — always empty here).
     ///      With L=1000*sqrt(in*out) the intended trade is short; four bitmap steps suffice.
+    ///      Fee is hardcoded to zero because the shell pool enforces fee == 0.
     function simulate(uint160 start, uint128 liquidity, int256 specified, bool zeroForOne, int24 spacing)
         internal
         pure
@@ -138,22 +166,47 @@ library RingLPPlanner {
     {
         price = start;
         int24 tick = TickMath.getTickAtSqrtPrice(price);
+        // `remaining` tracks the unfulfilled portion of `specified`:
+        //   negative = exact input (consume stepIn to shrink it toward 0)
+        //   positive = exact output (consume stepOut to shrink it toward 0)
         int256 remaining = specified;
         for (uint256 i; i < 4 && remaining != 0; ++i) {
+            // Compress the current tick into spacing units, then find the nearest
+            // 256-tick bitmap word boundary in the swap direction.
+            //   zeroForOne (price decreasing): boundary = start of the current word
+            //   oneForZero (price increasing): boundary = end of the next word
             int24 compressed = _floor(tick, spacing);
             int24 next =
                 zeroForOne ? (compressed >> 8) * 256 * spacing : (((compressed + 1) >> 8) * 256 + 255) * spacing;
             if (next <= TickMath.MIN_TICK || next >= TickMath.MAX_TICK) revert UnrepresentableOrder();
+            // The sqrtPrice at the word boundary — the furthest price this step can reach.
             uint160 boundary = TickMath.getSqrtPriceAtTick(next);
             uint256 stepIn;
             uint256 stepOut;
+            // computeSwapStep solves the constant-product math for this leg:
+            //   how much input/output is consumed to move `price` to `boundary`
+            //   (or to fully satisfy `remaining`, whichever comes first).
+            //   Fee is 0 — the shell pool enforces fee == 0.
             (price, stepIn, stepOut,) = SwapMath.computeSwapStep(price, boundary, liquidity, remaining, 0);
             input += stepIn;
             output += stepOut;
+            // Shrink `remaining` by the consumed amount.
+            //   exact input (specified < 0): remaining += stepIn (approaches 0 from below)
+            //   exact output (specified > 0): remaining -= stepOut (approaches 0 from above)
             remaining = specified < 0 ? remaining + SafeCast.toInt256(stepIn) : remaining - SafeCast.toInt256(stepOut);
+            // If the price reached the word boundary, step past it so the next
+            // iteration starts inside the adjacent word. Otherwise the swap
+            // terminated mid-word — recover the exact tick from the final price.
             if (price == boundary) tick = zeroForOne ? next - 1 : next;
             else tick = TickMath.getTickAtSqrtPrice(price);
         }
+        // If we still have unfulfilled input/output after 4 word-boundary steps,
+        // the trade is too large for this liquidity level — reject.
         if (remaining != 0) revert UnrepresentableOrder();
+    }
+
+    function _floor(int24 tick, int24 spacing) private pure returns (int24 compressed) {
+        compressed = tick / spacing;
+        if (tick < 0 && tick % spacing != 0) --compressed;
     }
 }

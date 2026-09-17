@@ -89,10 +89,10 @@ contract RingV4JitHookForkTest is Test {
         );
 
         // ------------------------------------------------------------------
-        // 4. Deploy hook (CREATE2 mine for flags 0x20c0)
+        // 4. Deploy hook (CREATE2 mine for flags 0x28c0)
         // ------------------------------------------------------------------
         bytes memory args = abi.encode(pm, few, address(this));
-        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x20c0, 10_000_000);
+        (bytes32 salt,) = HookMiner.mine(address(this), type(RingV4JitHook).creationCode, args, 0x28c0, 10_000_000);
         hook = new RingV4JitHook{salt: salt}(pm, few, address(this));
 
         // ------------------------------------------------------------------
@@ -109,7 +109,7 @@ contract RingV4JitHookForkTest is Test {
         assertTrue(hook.getLpPool(key).orderAligned, "wrapper ordering should be aligned");
 
         // ------------------------------------------------------------------
-        // 7. Fund rounding buffers (MIN_BUFFER = 16)
+        // 7. Fund rounding reserves (MIN_RESERVE = 16)
         // ------------------------------------------------------------------
         IERC20(WBTC).approve(address(hook), type(uint256).max);
         IERC20(WETH).approve(address(hook), type(uint256).max);
@@ -171,10 +171,10 @@ contract RingV4JitHookForkTest is Test {
         assertTrue(p.afterSwap);
         assertFalse(p.beforeSwapReturnDelta);
         assertFalse(p.afterSwapReturnDelta);
-        assertEq(uint160(address(hook)) & 0x3FFF, 0x20C0);
+        assertEq(uint160(address(hook)) & 0x3FFF, 0x28C0);
         assertEq(hook.MAX_ROUNDING_LOSS(), 8);
         assertEq(hook.MAX_SPOT_DEVIATION_BPS(), 500);
-        assertEq(hook.MIN_BUFFER(), 16);
+        assertEq(hook.MIN_RESERVE(), 16);
     }
 
     /// @notice Test quote is view-only and returns sensible values.
